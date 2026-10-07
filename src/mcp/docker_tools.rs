@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::ToolProvider;
-use crate::docker::{self, DockerCli, LABEL_MANAGED, LABEL_ROLE, LABEL_SESSION};
+use crate::docker::{self, DockerCli, LABEL_CONFIG, LABEL_MANAGED, LABEL_ROLE, LABEL_SESSION};
 use crate::paths::{Mount, MountMode};
 use crate::state::{
     ContainerRecord, DockerPolicy, ImageOrigin, ImageRecord, NetworkRecord, Resources, StateError, StateStore,
@@ -33,6 +33,8 @@ const MAX_OUTPUT: usize = 64 * 1024;
 /// Session facts the tools need.
 #[derive(Debug, Clone)]
 pub struct SessionCtx {
+    /// Value of the `roc.config` label.
+    pub config_label: String,
     /// Session id.
     pub session_id: String,
     /// Session network name.
@@ -169,12 +171,8 @@ impl DockerTools {
         Ok(())
     }
 
-    fn short(&self) -> &str {
-        &self.ctx.session_id[..self.ctx.session_id.len().min(6)]
-    }
-
     fn prefixed(&self, name: &str) -> String {
-        let p = format!("roc-{}-", self.short());
+        let p = format!("roc-{}-", self.ctx.session_id);
         if name.starts_with(&p) {
             name.to_string()
         } else {
@@ -185,6 +183,7 @@ impl DockerTools {
     fn labels(&self, role: &str) -> Vec<String> {
         vec![
             format!("--label={LABEL_MANAGED}=true"),
+            format!("--label={LABEL_CONFIG}={}", self.ctx.config_label),
             format!("--label={LABEL_SESSION}={}", self.ctx.session_id),
             format!("--label={LABEL_ROLE}={role}"),
         ]
@@ -917,6 +916,7 @@ mod tests {
             d,
             None,
             SessionCtx {
+                config_label: "cfg".into(),
                 session_id: "sess1".into(),
                 network: "roc-sess1".into(),
                 mounts: vec![
@@ -1212,6 +1212,7 @@ mod tests {
                         binary: "opencode".into(),
                         image: "i".into(),
                         model: "m".into(),
+                        key: String::new(),
                         worker: 1,
                         container: "roc-sess1".into(),
                         network: "roc-sess1".into(),
