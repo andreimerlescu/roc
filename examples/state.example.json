@@ -1,0 +1,224 @@
+{
+  "$schema": "https://raw.githubusercontent.com/playandprosper/roc/main/schema/state.schema.json",
+  "version": 1,
+  "updated_at": "2026-10-07T14:00:00Z",
+  "config": {
+    "ai": {
+      "provider_id": "lmstudio-studio",
+      "provider_name": "Office Mac Studio 256GB",
+      "host": "http://192.168.128.2:17369/v1",
+      "container_host": "",
+      "api_token_env": "ROC_AI_API_TOKEN",
+      "model": "qwen3.8-27b",
+      "qty": 4,
+      "name_template": "Q #{n} on Studio",
+      "label_template": "Q #{n}",
+      "limit": {
+        "context": 256256,
+        "output": 32768
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Q #1 on Studio",
+          "label": "Q #1",
+          "worker": 1,
+          "limit": {
+            "context": 256256,
+            "output": 32768
+          },
+          "enabled": true
+        },
+        "qwen3.8-27b:2": {
+          "name": "Q #2 on Studio",
+          "label": "Q #2",
+          "worker": 2,
+          "limit": {
+            "context": 256256,
+            "output": 32768
+          },
+          "enabled": true
+        },
+        "qwen3.8-27b:3": {
+          "name": "Q #3 on Studio",
+          "label": "Q #3",
+          "worker": 3,
+          "limit": {
+            "context": 256256,
+            "output": 32768
+          },
+          "enabled": true
+        },
+        "qwen3.8-27b:4": {
+          "name": "Q #4 on Studio",
+          "label": "Q #4",
+          "worker": 4,
+          "limit": {
+            "context": 256256,
+            "output": 32768
+          },
+          "enabled": true
+        }
+      }
+    },
+    "agent": {
+      "binary": "opencode",
+      "image": "roc-agent:latest",
+      "env_passthrough": [],
+      "publish": [],
+      "mount_gitconfig": true,
+      "extra_docker_args": [],
+      "opencode_overrides": {
+        "agent": {
+          "build": {
+            "temperature": 1,
+            "top_p": 0.95
+          }
+        }
+      },
+      "codex_wire_api": "responses",
+      "memory": "",
+      "cpus": ""
+    },
+    "mounts": {
+      "read": [
+        "~/work",
+        "~/statuses"
+      ],
+      "write": [
+        "~/friends_of/planning",
+        "~/friends_of/knowledge"
+      ],
+      "denied": []
+    },
+    "mcp": {
+      "bind": "auto",
+      "port": 0,
+      "request_timeout_secs": 600,
+      "servers": {
+        "browsermcp": {
+          "type": "host",
+          "enabled": true,
+          "description": "Drive your real host browser via the Browser MCP extension",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@browsermcp/mcp@latest"
+          ]
+        },
+        "context7": {
+          "type": "remote",
+          "enabled": false,
+          "description": "Up-to-date library documentation (requires internet)",
+          "url": "https://mcp.context7.com/mcp"
+        },
+        "docker": {
+          "type": "builtin",
+          "enabled": true,
+          "description": "roc's policy-enforced Docker server: create/run/exec/remove only containers, images and networks this session created"
+        },
+        "playwright": {
+          "type": "container",
+          "enabled": false,
+          "description": "Headless Chromium inside the container (build image with WITH_PLAYWRIGHT=1)",
+          "command": "playwright-mcp",
+          "args": [
+            "--headless",
+            "--isolated",
+            "--no-sandbox"
+          ]
+        },
+        "xcode": {
+          "type": "host",
+          "enabled": false,
+          "description": "Xcode 26.3+ built-in MCP (enable Settings > Intelligence > MCP in Xcode)",
+          "command": "xcrun",
+          "args": [
+            "mcpbridge"
+          ],
+          "platforms": [
+            "macos"
+          ]
+        },
+        "xcodebuildmcp": {
+          "type": "host",
+          "enabled": true,
+          "description": "Build, run and test Xcode projects; boot/control iOS simulators; UI automation and screenshots",
+          "command": "npx",
+          "args": [
+            "-y",
+            "xcodebuildmcp@latest",
+            "mcp"
+          ],
+          "platforms": [
+            "macos"
+          ]
+        }
+      }
+    },
+    "docker": {
+      "max_containers": 20,
+      "max_images": 20,
+      "image_tag_prefix": "roc-local/",
+      "allow_pull": true,
+      "allow_publish": true,
+      "publish_bind": "127.0.0.1",
+      "remove_images_on_exit": true,
+      "command_timeout_secs": 1800
+    }
+  },
+  "sessions": {
+    "3f9a1c2b7d4e": {
+      "id": "3f9a1c2b7d4e",
+      "pid": 48211,
+      "hostname": "andrei-mbp",
+      "started_at": "2026-10-07T13:52:10Z",
+      "status": "running",
+      "binary": "opencode",
+      "image": "roc-agent:latest",
+      "model": "qwen3.8-27b:2",
+      "worker": 2,
+      "container": "roc-3f9a1c2b7d4e",
+      "network": "roc-3f9a1c2b7d4e",
+      "gateway": "127.0.0.1:53817",
+      "mounts": [
+        {
+          "path": "/Users/andrei/friends_of/planning",
+          "source": "/Users/andrei/friends_of/planning",
+          "mode": "rw"
+        },
+        {
+          "path": "/Users/andrei/work",
+          "source": "/Users/andrei/work",
+          "mode": "ro"
+        }
+      ],
+      "workdir": "/Users/andrei/friends_of/planning",
+      "resources": {
+        "containers": [
+          {
+            "id": "9c1e\u2026",
+            "name": "roc-3f9a1c-postgres",
+            "image": "postgres:17",
+            "role": "workload",
+            "created_at": "2026-10-07T13:55:02Z"
+          }
+        ],
+        "images": [
+          {
+            "id": "sha256:5b0d\u2026",
+            "reference": "roc-local/planning-api:dev",
+            "origin": "build",
+            "created_at": "2026-10-07T13:58:40Z"
+          }
+        ],
+        "networks": [
+          {
+            "id": "d41a\u2026",
+            "name": "roc-3f9a1c2b7d4e",
+            "created_at": "2026-10-07T13:52:11Z"
+          }
+        ]
+      }
+    }
+  }
+}
