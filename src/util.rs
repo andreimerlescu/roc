@@ -142,6 +142,16 @@ pub fn write_private_file(p: &Path, contents: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// FNV-1a 64-bit hash, hex encoded (stable identifiers, not security).
+pub fn fnv1a_hex(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// Constant-time byte comparison (for bearer tokens).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -215,6 +225,13 @@ mod tests {
         assert!(pid_alive(std::process::id()));
         assert!(!pid_alive(0));
         assert!(!pid_alive(u32::MAX));
+    }
+
+    #[test]
+    fn fnv_is_stable() {
+        assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex(b"a"), "af63dc4c8601ec8c");
+        assert_ne!(fnv1a_hex(b"/a/state.json"), fnv1a_hex(b"/b/state.json"));
     }
 
     #[test]

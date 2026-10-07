@@ -13,6 +13,8 @@ use crate::state::Session;
 pub const LABEL_MANAGED: &str = "roc.managed";
 /// Label holding the owning session id.
 pub const LABEL_SESSION: &str = "roc.session";
+/// Label identifying the roc configuration (state file) that owns a resource.
+pub const LABEL_CONFIG: &str = "roc.config";
 /// Label holding the role (`agent`, `workload`, `network`, `image`).
 pub const LABEL_ROLE: &str = "roc.role";
 /// Home directory of the agent inside the container.
@@ -211,6 +213,8 @@ pub fn validate_extra_args(args: &[String]) -> Result<(), String> {
 /// Everything needed to start the agent container.
 #[derive(Debug, Clone)]
 pub struct AgentRun {
+    /// Value of the `roc.config` label.
+    pub config_label: String,
     /// Session id.
     pub session_id: String,
     /// Container name.
@@ -260,6 +264,7 @@ pub fn agent_run_args(r: &AgentRun) -> Vec<String> {
     a.push(format!("--name={}", r.container));
     a.push(format!("--hostname=roc-{}", r.session_id));
     a.push(format!("--label={LABEL_MANAGED}=true"));
+    a.push(format!("--label={LABEL_CONFIG}={}", r.config_label));
     a.push(format!("--label={LABEL_SESSION}={}", r.session_id));
     a.push(format!("--label={LABEL_ROLE}=agent"));
     a.push(format!("--network={}", r.network));
@@ -376,31 +381,49 @@ pub fn cleanup_session(d: &dyn DockerCli, s: &Session, remove_images: bool) -> V
     errors
 }
 
-/// Removes roc-labelled containers/networks whose session is not live.
-/// Returns the number of resources removed.
-pub fn sweep_orphans(d: &dyn DockerCli, live_sessions: &BTreeSet<String>) -> usize {
-    let mut removed = 0;
+fn owned_list(d: &dyn DockerCli, kind: &[&str], config_label: &str) -> Vec<(String, String)> {
     let fmt = format!("{{{{.ID}}}} {{{{.Label \"{LABEL_SESSION}\"}}}}");
-    let managed = format!("label={LABEL_MANAGED}=true");
-    if let Ok(out) = d.ok(&["ps", "-a", "--no-trunc", "--filter", &managed, "--format", &fmt]) {
-        for l in lines(&out) {
-            let mut it = l.split_whitespace();
-            if let (Some(id), sess) = (it.next(), it.next().unwrap_or("")) {
-                if !live_sessions.contains(sess) && d.ok(&["rm", "-f", "-v", id]).is_ok() {
-                    removed += 1;
-                }
-            }
+    let owner = format!("label={LABEL_CONFIG}={config_label}");
+    let mut args: Vec<&str> = kind.to_vec();
+    args.extend(["--no-trunc", "--filter", &owner, "--format", &fmt]);
+    d.ok(&args)
+        .map(|out| {
+            lines(&out)
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    Some((it.next()?.to_string(), it.next().unwrap_or("").to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Removes containers and networks of this roc configuration whose session
+/// no longer exists. Resources are listed before `sessions()` is read: a
+/// session is recorded before it creates anything, so every listed resource
+/// of a running session is guaranteed to appear in that later read.
+/// `sessions` returning `None` (state unreadable) removes nothing.
+/// Returns the number of resources removed.
+pub fn sweep_orphans(
+    d: &dyn DockerCli,
+    config_label: &str,
+    sessions: impl FnOnce() -> Option<BTreeSet<String>>,
+) -> usize {
+    let containers = owned_list(d, &["ps", "-a"], config_label);
+    let networks = owned_list(d, &["network", "ls"], config_label);
+    if containers.is_empty() && networks.is_empty() {
+        return 0;
+    }
+    let Some(live) = sessions() else { return 0 };
+    let mut removed = 0;
+    for (id, sess) in containers {
+        if !live.contains(&sess) && d.ok(&["rm", "-f", "-v", &id]).is_ok() {
+            removed += 1;
         }
     }
-    let nfmt = format!("{{{{.ID}}}} {{{{.Label \"{LABEL_SESSION}\"}}}}");
-    if let Ok(out) = d.ok(&["network", "ls", "--no-trunc", "--filter", &managed, "--format", &nfmt]) {
-        for l in lines(&out) {
-            let mut it = l.split_whitespace();
-            if let (Some(id), sess) = (it.next(), it.next().unwrap_or("")) {
-                if !live_sessions.contains(sess) && d.ok(&["network", "rm", id]).is_ok() {
-                    removed += 1;
-                }
-            }
+    for (id, sess) in networks {
+        if !live.contains(&sess) && d.ok(&["network", "rm", &id]).is_ok() {
+            removed += 1;
         }
     }
     removed
@@ -494,6 +517,7 @@ mod tests {
 
     fn run() -> AgentRun {
         AgentRun {
+            config_label: "cfg".into(),
             session_id: "abc123".into(),
             container: "roc-abc123".into(),
             network: "roc-abc123".into(),
@@ -600,6 +624,7 @@ mod tests {
             binary: "opencode".into(),
             image: "i".into(),
             model: "m".into(),
+            key: String::new(),
             worker: 1,
             container: "roc-abc".into(),
             network: "roc-abc".into(),
@@ -640,17 +665,46 @@ mod tests {
         let d = MockDocker::new(|args| {
             let j = args.join(" ");
             if j.starts_with("ps -a") {
+                assert!(j.contains("--filter label=roc.config=cfg1"), "{j}");
                 MockDocker::out("c1 live\nc2 dead\nc3 \n")
             } else {
                 MockDocker::out("")
             }
         });
         let live: BTreeSet<String> = ["live".to_string()].into();
-        assert_eq!(sweep_orphans(&d, &live), 2);
+        assert_eq!(sweep_orphans(&d, "cfg1", || Some(live)), 2);
+        assert_eq!(
+            sweep_orphans(&d, "cfg1", || None),
+            0,
+            "unreadable state removes nothing"
+        );
         let calls = d.joined();
         assert!(calls.contains(&"rm -f -v c2".to_string()));
         assert!(calls.contains(&"rm -f -v c3".to_string()));
         assert!(!calls.contains(&"rm -f -v c1".to_string()));
+    }
+
+    #[test]
+    fn orphan_sweep_reads_sessions_after_listing() {
+        use std::sync::{Arc, Mutex};
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let o2 = order.clone();
+        let d = MockDocker::new(move |args| {
+            o2.lock().unwrap().push(args[0].clone());
+            if args[0] == "ps" {
+                MockDocker::out("c9 s9\n")
+            } else {
+                MockDocker::out("")
+            }
+        });
+        let o3 = order.clone();
+        let n = sweep_orphans(&d, "cfg", move || {
+            o3.lock().unwrap().push("sessions".into());
+            Some(["s9".to_string()].into())
+        });
+        assert_eq!(n, 0, "a session that appears by the time state is read is kept");
+        let seq = order.lock().unwrap().clone();
+        assert_eq!(seq, vec!["ps", "network", "sessions"]);
     }
 
     #[test]

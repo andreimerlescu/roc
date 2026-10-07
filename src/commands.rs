@@ -1,14 +1,17 @@
-//! Non-session commands: -init, -show-state, -list, -cleanup, -build-image.
+//! Non-session commands: -init, -show-state, -list, -cleanup, -build-image,
+//! -agent-config.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use crate::agent_files::AgentFiles;
+use crate::agents::Agent;
 use crate::cli::{self, Args};
 use crate::docker::{self, DockerCli, RealDocker};
 use crate::error::Result;
-use crate::lmstudio::{self, Probe};
 use crate::pool;
-use crate::state::{StateError, StateStore};
+use crate::provider::{self, Probe};
+use crate::state::{ProviderKind, StateError, StateStore};
 use crate::util;
 
 /// The agent image Dockerfile embedded in the binary.
@@ -20,7 +23,12 @@ pub const ENTRYPOINT: &str = include_str!("../docker/entrypoint.sh");
 pub fn dispatch(args: Args) -> Result<i32> {
     let store = StateStore::new(cli::state_path(&args)?);
     if args.init {
-        return init(&store, args.force);
+        use std::io::IsTerminal;
+        let interactive = !args.yes && std::io::stdin().is_terminal();
+        return crate::init::run(&store, &args, interactive);
+    }
+    if args.agent_config {
+        return agent_config(&store, &args);
     }
     if args.show_state {
         let st = store.load()?;
@@ -40,15 +48,25 @@ pub fn dispatch(args: Args) -> Result<i32> {
     crate::session::run(&store, &args)
 }
 
-fn init(store: &StateStore, force: bool) -> Result<i32> {
-    if store.init(force)? {
-        println!("wrote {}", store.path().display());
-    } else {
-        println!(
-            "{} already exists (use -init -force to reset it; a backup is kept)",
-            store.path().display()
-        );
+fn agent_config(store: &StateStore, args: &Args) -> Result<i32> {
+    let st = store.load()?;
+    let agent: Agent = args.binary.as_deref().unwrap_or(&st.config.agent.binary).parse()?;
+    let files = AgentFiles::new(&store.dir());
+    for p in files.ensure(&st.config.agent.opencode_overrides)? {
+        println!("created {}", p.display());
     }
+    let overlay = files.overlay_path(agent);
+    println!("{agent} settings for this roc config ({}):", store.path().display());
+    println!("  {}", overlay.display());
+    println!("      merged over the config roc generates; anything set here wins");
+    println!("  {}", files.instructions_path().display());
+    println!("      rules given to every agent (never ask, finish AGENTS.md)");
+    println!();
+    let raw = std::fs::read_to_string(&overlay).unwrap_or_default();
+    print!("{raw}");
+    files.load_overlay(agent)?;
+    println!();
+    println!("`roc -dry-run -binary {agent}` prints the final merged config.");
     Ok(0)
 }
 
@@ -61,18 +79,18 @@ pub fn resolve_token(args: &Args, env_name: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Probes LM Studio unless `-assume-available`.
-pub fn probe_for(args: &Args, host: &str, token: Option<&str>) -> Probe {
+/// Probes the model server unless `-assume-available`.
+pub fn probe_for(args: &Args, kind: ProviderKind, host: &str, token: Option<&str>) -> Probe {
     if args.assume_available {
         Probe::Skipped
     } else {
-        lmstudio::probe(host, token, Duration::from_secs(3))
+        provider::probe(kind, host, token, Duration::from_secs(3))
     }
 }
 
 fn list(store: &StateStore, args: &Args) -> Result<i32> {
     // AI flags given with -list update the pool definition first.
-    let st = if args.ai_host.is_some() || args.ai_model.is_some() || args.qty.is_some() {
+    let st = if cli::has_ai_flags(args) {
         store.update(|st| {
             cli::apply_ai_flags(st, args)?;
             Ok::<_, crate::error::Error>(st.clone())
@@ -80,12 +98,24 @@ fn list(store: &StateStore, args: &Args) -> Result<i32> {
     } else {
         store.load()?
     };
-    let token = resolve_token(args, &st.config.ai.api_token_env);
-    let probe = probe_for(args, &st.config.ai.host, token.as_deref());
-    let rows = pool::view(&st.config.ai, &st.live_leases(), &probe);
+    let ai = &st.config.ai;
+    if ai.provider == ProviderKind::None {
+        let running = st.sessions.len();
+        if args.json {
+            let out = serde_json::json!({"provider": "none", "sessions": running, "workers": []});
+            println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+        } else {
+            println!("provider none: agents use their own models ({running} session(s) running)");
+        }
+        return Ok(0);
+    }
+    let token = resolve_token(args, &ai.api_token_env);
+    let probe = probe_for(args, ai.provider, &ai.host, token.as_deref());
+    let rows = pool::view(ai, &st.live_leases(), &probe);
     if args.json {
         let out = serde_json::json!({
-            "host": st.config.ai.host,
+            "provider": ai.provider.name(),
+            "host": ai.host,
             "reachable": !matches!(probe, Probe::Unreachable(_)),
             "workers": rows,
         });
@@ -93,7 +123,7 @@ fn list(store: &StateStore, args: &Args) -> Result<i32> {
     } else {
         print!("{}", pool::render_list(&rows));
         if let Probe::Unreachable(why) = &probe {
-            eprintln!("roc: LM Studio at {} is unreachable ({why})", st.config.ai.host);
+            eprintln!("roc: {} at {} is unreachable ({why})", ai.provider_name, ai.host);
         }
     }
     Ok(0)
@@ -128,8 +158,12 @@ pub fn cleanup(store: &StateStore, docker: &dyn DockerCli, verbose: bool) -> Res
         }
     }
     if docker_ok {
-        let live: BTreeSet<String> = store.load()?.sessions.keys().cloned().collect();
-        let n = docker::sweep_orphans(docker, &live);
+        let n = docker::sweep_orphans(docker, &store.config_label(), || {
+            store
+                .load()
+                .ok()
+                .map(|s| s.sessions.keys().cloned().collect::<BTreeSet<String>>())
+        });
         if verbose && n > 0 {
             println!("removed {n} orphaned roc resource(s)");
         }

@@ -2,7 +2,7 @@
 //!
 //! The file has two halves:
 //!
-//! * `config`   — durable, user-editable configuration: the LM Studio host, the
+//! * `config`   — durable, user-editable configuration: the model server, the
 //!   worker pool (`config.ai.models`), agent defaults, MCP servers and the
 //!   Docker policy enforced on the agent.
 //! * `sessions` — runtime bookkeeping: one entry per live `roc` process holding
@@ -110,10 +110,14 @@ impl Default for Limit {
     }
 }
 
-/// One worker: a loaded instance of the model in LM Studio.
+/// One worker: one slot of the model on the inference server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelEntry {
-    /// Display name, e.g. `Q #2 on Studio`.
+    /// Model id sent to the server when it differs from the worker key
+    /// (Ollama and OpenAI-compatible servers serve every slot under one id).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Display name, e.g. `Q #2 Agent`.
     pub name: String,
     /// Short label used by `roc -list`, e.g. `Q #2`.
     #[serde(default)]
@@ -132,10 +136,79 @@ fn yes() -> bool {
     true
 }
 
-/// Local inference server (LM Studio) configuration and the worker pool.
+/// Which kind of model server the agents talk to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// LM Studio: duplicate model instances are `model`, `model:2`, …
+    #[default]
+    Lmstudio,
+    /// Ollama: one model id, parallel slots (`OLLAMA_NUM_PARALLEL`).
+    Ollama,
+    /// Any OpenAI-compatible endpoint, local or public.
+    Openai,
+    /// roc configures no model; agents use their own providers and logins.
+    None,
+}
+
+impl ProviderKind {
+    /// Lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            ProviderKind::Lmstudio => "lmstudio",
+            ProviderKind::Ollama => "ollama",
+            ProviderKind::Openai => "openai",
+            ProviderKind::None => "none",
+        }
+    }
+
+    /// Display name used for the provider in agent configs.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ProviderKind::Lmstudio => "LM Studio",
+            ProviderKind::Ollama => "Ollama",
+            ProviderKind::Openai => "OpenAI-compatible",
+            ProviderKind::None => "agent default",
+        }
+    }
+
+    /// The server's default base URL.
+    pub fn default_host(self) -> &'static str {
+        match self {
+            ProviderKind::Lmstudio => "http://127.0.0.1:1234/v1",
+            ProviderKind::Ollama => "http://127.0.0.1:11434/v1",
+            ProviderKind::Openai => "https://api.openai.com/v1",
+            ProviderKind::None => "",
+        }
+    }
+
+    /// Whether duplicate instances get distinct model ids (`model:2`).
+    pub fn suffixed_instances(self) -> bool {
+        self == ProviderKind::Lmstudio
+    }
+}
+
+impl std::str::FromStr for ProviderKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lmstudio" | "lm-studio" | "lms" => Ok(ProviderKind::Lmstudio),
+            "ollama" => Ok(ProviderKind::Ollama),
+            "openai" | "openai-compatible" | "public" => Ok(ProviderKind::Openai),
+            "none" | "agent" => Ok(ProviderKind::None),
+            other => Err(format!(
+                "unknown provider {other:?}: expected lmstudio, ollama, openai or none"
+            )),
+        }
+    }
+}
+
+/// Model server configuration and the worker pool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AiConfig {
+    /// Server kind.
+    pub provider: ProviderKind,
     /// Provider id used in generated agent configs.
     pub provider_id: String,
     /// Human readable provider name.
@@ -147,18 +220,20 @@ pub struct AiConfig {
     pub container_host: String,
     /// Environment variable holding the API token (never stored here).
     pub api_token_env: String,
-    /// Base model id (worker 1). Worker N>1 is `<model>:<N>`.
+    /// Base model id. LM Studio worker N>1 is `<model>:<N>`; for other
+    /// providers every worker uses `<model>`.
     pub model: String,
     /// Number of workers in the pool.
     pub qty: u32,
-    /// Template for `name`; `{n}` is the worker number.
+    /// Template for `name`; `{n}` is the worker number, `{initial}` the
+    /// model's first letter.
     pub name_template: String,
-    /// Template for `label`; `{n}` is the worker number.
+    /// Template for `label` (same placeholders).
     pub label_template: String,
     /// Default limits for generated workers.
     pub limit: Limit,
-    /// Worker pool keyed by the exact LM Studio model id. When absent it is
-    /// generated from `model` × `qty`.
+    /// Worker pool keyed by worker key (for LM Studio, the exact model id).
+    /// When absent it is generated from `model` × `qty`.
     #[serde(default = "BTreeMap::new")]
     pub models: BTreeMap<String, ModelEntry>,
 }
@@ -166,15 +241,16 @@ pub struct AiConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         let mut ai = AiConfig {
+            provider: ProviderKind::Lmstudio,
             provider_id: "lmstudio".into(),
             provider_name: "LM Studio".into(),
-            host: "http://127.0.0.1:1234/v1".into(),
+            host: ProviderKind::Lmstudio.default_host().into(),
             container_host: String::new(),
             api_token_env: "ROC_AI_API_TOKEN".into(),
             model: "qwen3.8-27b".into(),
             qty: 4,
-            name_template: "Q #{n} on Studio".into(),
-            label_template: "Q #{n}".into(),
+            name_template: "{initial} #{n} Agent".into(),
+            label_template: "{initial} #{n}".into(),
             limit: Limit::default(),
             models: BTreeMap::new(),
         };
@@ -192,23 +268,76 @@ pub fn worker_model_id(base: &str, n: u32) -> String {
     }
 }
 
+/// Uppercase first letter of the model name (ignoring any `org/` prefix).
+pub fn model_initial(model: &str) -> String {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    name.chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "W".into())
+}
+
+/// Expands `{n}` and `{initial}` in a name template.
+pub fn expand_template(t: &str, model: &str, n: u32) -> String {
+    t.replace("{n}", &n.to_string())
+        .replace("{initial}", &model_initial(model))
+}
+
 impl AiConfig {
     /// Builds the pool for `model` × `qty`, keeping customised names/limits of
     /// entries that already exist.
     pub fn generate_models(&self, existing: &BTreeMap<String, ModelEntry>) -> BTreeMap<String, ModelEntry> {
         (1..=self.qty.clamp(1, MAX_WORKERS))
             .map(|n| {
-                let id = worker_model_id(&self.model, n);
-                let entry = existing.get(&id).cloned().unwrap_or_else(|| ModelEntry {
-                    name: self.name_template.replace("{n}", &n.to_string()),
-                    label: self.label_template.replace("{n}", &n.to_string()),
+                let key = self.worker_key(n);
+                let entry = existing.get(&key).cloned().unwrap_or_else(|| ModelEntry {
+                    model: if self.provider.suffixed_instances() || key == self.model {
+                        String::new()
+                    } else {
+                        self.model.clone()
+                    },
+                    name: expand_template(&self.name_template, &self.model, n),
+                    label: expand_template(&self.label_template, &self.model, n),
                     worker: n,
                     limit: self.limit,
                     enabled: true,
                 });
-                (id, entry)
+                (key, entry)
             })
             .collect()
+    }
+
+    /// Pool key of worker `n`: LM Studio uses its instance ids (`model:2`);
+    /// other providers use `model#2` and send `model` to the server.
+    pub fn worker_key(&self, n: u32) -> String {
+        if self.provider.suffixed_instances() || n <= 1 {
+            worker_model_id(&self.model, n)
+        } else {
+            format!("{}#{n}", self.model)
+        }
+    }
+
+    /// Model id sent to the server for the worker stored under `key`.
+    pub fn api_model<'a>(&self, key: &'a str, m: &'a ModelEntry) -> &'a str {
+        if m.model.is_empty() { key } else { &m.model }
+    }
+
+    /// Switches provider kind, resetting provider defaults that were untouched.
+    pub fn set_provider(&mut self, kind: ProviderKind) {
+        if self.provider == kind {
+            return;
+        }
+        let old = self.provider;
+        if self.host.is_empty() || self.host == old.default_host() {
+            self.host = kind.default_host().into();
+        }
+        if self.provider_id.is_empty() || self.provider_id == old.name() {
+            self.provider_id = kind.name().into();
+        }
+        if self.provider_name.is_empty() || self.provider_name == old.display_name() {
+            self.provider_name = kind.display_name().into();
+        }
+        self.provider = kind;
     }
 
     /// Workers sorted by worker number.
@@ -221,7 +350,7 @@ impl AiConfig {
     /// Label for a model entry (falls back to the template).
     pub fn label_of(&self, m: &ModelEntry) -> String {
         if m.label.is_empty() {
-            self.label_template.replace("{n}", &m.worker.to_string())
+            expand_template(&self.label_template, &self.model, m.worker)
         } else {
             m.label.clone()
         }
@@ -244,7 +373,9 @@ pub struct AgentConfig {
     pub mount_gitconfig: bool,
     /// Extra `docker run` flags (advanced; validated against a deny list).
     pub extra_docker_args: Vec<String>,
-    /// Deep-merged into the generated opencode.json.
+    /// Legacy (0.1.0): merged into `agents/opencode.json` when that file is
+    /// first created. No longer written.
+    #[serde(skip_serializing)]
     pub opencode_overrides: Value,
     /// Codex `wire_api` for the local provider (`responses` or `chat`).
     pub codex_wire_api: String,
@@ -263,9 +394,7 @@ impl Default for AgentConfig {
             publish: vec![],
             mount_gitconfig: true,
             extra_docker_args: vec![],
-            opencode_overrides: serde_json::json!({
-                "agent": { "build": { "temperature": 1, "top_p": 0.95 } }
-            }),
+            opencode_overrides: Value::Null,
             codex_wire_api: "responses".into(),
             memory: String::new(),
             cpus: String::new(),
@@ -534,9 +663,12 @@ pub struct Session {
     pub binary: String,
     /// Agent image.
     pub image: String,
-    /// Leased model id.
+    /// Model id sent to the server (empty with provider `none`).
     pub model: String,
-    /// Leased worker number.
+    /// Leased worker key (pool key; empty with provider `none`).
+    #[serde(default)]
+    pub key: String,
+    /// Leased worker number (0 with provider `none`).
     pub worker: u32,
     /// Agent container name.
     pub container: String,
@@ -634,7 +766,17 @@ impl State {
         self.sessions
             .values()
             .filter(|s| s.hostname != host || util::pid_alive(s.pid))
-            .map(|s| (s.model.clone(), s.id.clone()))
+            .filter(|s| !s.key.is_empty() || !s.model.is_empty())
+            .map(|s| {
+                (
+                    if s.key.is_empty() {
+                        s.model.clone()
+                    } else {
+                        s.key.clone()
+                    },
+                    s.id.clone(),
+                )
+            })
             .collect()
     }
 
@@ -653,7 +795,9 @@ impl State {
                 return Err(format!("config.ai.models[{id}].worker must be unique and >= 1"));
             }
         }
-        url::Url::parse(&ai.host).map_err(|e| format!("config.ai.host {:?}: {e}", ai.host))?;
+        if ai.provider != ProviderKind::None {
+            url::Url::parse(&ai.host).map_err(|e| format!("config.ai.host {:?}: {e}", ai.host))?;
+        }
         for name in self.config.mcp.servers.keys() {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                 return Err(format!("config.mcp.servers: invalid server name {name:?}"));
@@ -736,6 +880,17 @@ impl StateStore {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// Identifier of this configuration, used to label its Docker resources
+    /// (derived from the state file's absolute path).
+    pub fn config_label(&self) -> String {
+        let p = self
+            .dir()
+            .canonicalize()
+            .map(|d| d.join(self.path.file_name().unwrap_or_default()));
+        let p = p.unwrap_or_else(|_| self.path.clone());
+        util::fnv1a_hex(p.to_string_lossy().as_bytes())[..12].to_string()
+    }
+
     /// Per-session scratch directory.
     pub fn session_dir(&self, id: &str) -> PathBuf {
         self.dir().join("sessions").join(id)
@@ -814,6 +969,12 @@ impl StateStore {
         Ok(())
     }
 
+    /// Runs `f` while holding the state lock (for files shared between sessions).
+    pub fn with_lock<T>(&self, f: impl FnOnce() -> T) -> Result<T, StateError> {
+        let _g = self.lock()?;
+        Ok(f())
+    }
+
     /// Reads a consistent snapshot.
     pub fn load(&self) -> Result<State, StateError> {
         let _g = self.lock()?;
@@ -871,8 +1032,8 @@ mod tests {
         assert_eq!(w[0].0, "qwen3.8-27b");
         assert_eq!(w[1].0, "qwen3.8-27b:2");
         assert_eq!(w[3].0, "qwen3.8-27b:4");
-        assert_eq!(w[0].1.name, "Q #1 on Studio");
-        assert_eq!(w[3].1.name, "Q #4 on Studio");
+        assert_eq!(w[0].1.name, "Q #1 Agent");
+        assert_eq!(w[3].1.name, "Q #4 Agent");
         assert_eq!(w[2].1.label, "Q #3");
         assert_eq!(
             w[0].1.limit,
@@ -1010,6 +1171,7 @@ mod tests {
             binary: "opencode".into(),
             image: "img".into(),
             model: model.into(),
+            key: String::new(),
             worker: 1,
             container: format!("roc-{id}"),
             network: format!("roc-{id}"),

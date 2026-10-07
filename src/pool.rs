@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::lmstudio::{Load, Probe};
+use crate::provider::{self, Load, Probe};
 use crate::state::AiConfig;
 
 /// Status shown by `roc -list`.
@@ -12,7 +12,7 @@ use crate::state::AiConfig;
 pub enum WorkerStatus {
     /// Leased by a live roc session.
     Running,
-    /// Loaded in LM Studio and free.
+    /// Servable by the model server and free.
     Available,
     /// Not loaded, disabled, or the server is unreachable.
     Offline,
@@ -33,11 +33,13 @@ impl fmt::Display for WorkerStatus {
 pub struct WorkerView {
     /// Worker number.
     pub worker: u32,
-    /// LM Studio model id.
+    /// Pool key (unique per worker).
+    pub key: String,
+    /// Model id sent to the server.
     pub model: String,
     /// Short label (`Q #1`).
     pub label: String,
-    /// Display name (`Q #1 on Studio`).
+    /// Display name (`Q #1 Agent`).
     pub name: String,
     /// Computed status.
     pub status: WorkerStatus,
@@ -50,8 +52,9 @@ pub struct WorkerView {
 pub fn view(ai: &AiConfig, leases: &BTreeMap<String, String>, probe: &Probe) -> Vec<WorkerView> {
     ai.workers()
         .into_iter()
-        .map(|(id, m)| {
-            let session = leases.get(id).cloned();
+        .map(|(key, m)| {
+            let model = ai.api_model(key, m).to_string();
+            let session = leases.get(key).cloned();
             let status = if session.is_some() {
                 WorkerStatus::Running
             } else if !m.enabled {
@@ -60,7 +63,7 @@ pub fn view(ai: &AiConfig, leases: &BTreeMap<String, String>, probe: &Probe) -> 
                 match probe {
                     Probe::Skipped => WorkerStatus::Available,
                     Probe::Unreachable(_) => WorkerStatus::Offline,
-                    Probe::Reachable(models) => match models.get(id) {
+                    Probe::Reachable(models) => match provider::lookup(models, &model) {
                         Some(Load::Loaded) => WorkerStatus::Available,
                         _ => WorkerStatus::Offline,
                     },
@@ -68,7 +71,8 @@ pub fn view(ai: &AiConfig, leases: &BTreeMap<String, String>, probe: &Probe) -> 
             };
             WorkerView {
                 worker: m.worker,
-                model: id.clone(),
+                key: key.clone(),
+                model,
                 label: ai.label_of(m),
                 name: m.name.clone(),
                 status,
@@ -178,6 +182,26 @@ mod tests {
         let rows = view(&ai, &BTreeMap::new(), &Probe::Skipped);
         assert_eq!(rows[0].status, WorkerStatus::Offline);
         assert_eq!(select(&rows, None).unwrap().worker, 2);
+    }
+
+    #[test]
+    fn ollama_workers_share_one_model_id() {
+        let mut ai = AiConfig::default();
+        ai.set_provider(crate::state::ProviderKind::Ollama);
+        ai.model = "qwen3:27b".into();
+        ai.models = ai.generate_models(&BTreeMap::new());
+        let mut leases = BTreeMap::new();
+        leases.insert("qwen3:27b#2".to_string(), "s2".to_string());
+        let rows = view(&ai, &leases, &probe(&[("qwen3:27b", Load::Loaded)]));
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| r.model == "qwen3:27b"));
+        assert_eq!(rows[0].key, "qwen3:27b");
+        assert_eq!(rows[1].key, "qwen3:27b#2");
+        assert_eq!(
+            render_list(&rows),
+            "Q #1: available\nQ #2: running\nQ #3: available\nQ #4: available\n"
+        );
+        assert_eq!(select(&rows, None).unwrap().worker, 1);
     }
 
     #[test]

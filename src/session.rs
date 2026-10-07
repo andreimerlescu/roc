@@ -10,20 +10,23 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::agents::{self, Agent, AgentInputs, McpEndpoint};
+use crate::agent_files::AgentFiles;
+use crate::agents::{self, Agent, AgentInputs, McpEndpoint, ModelTarget};
 use crate::cli::{self, Args};
 use crate::commands;
-use crate::docker::{self, AgentRun, DockerCli, LABEL_MANAGED, LABEL_ROLE, LABEL_SESSION, RealDocker};
+use crate::docker::{self, AgentRun, DockerCli, LABEL_CONFIG, LABEL_MANAGED, LABEL_ROLE, LABEL_SESSION, RealDocker};
 use crate::error::{Error, Result};
-use crate::lmstudio::{self, Probe};
 use crate::mcp::bridge::{BridgeConfig, StdioBridge};
 use crate::mcp::docker_tools::{DockerTools, SessionCtx};
 use crate::mcp::gateway::Gateway;
 use crate::mcp::{McpHandler, ToolServer};
 use crate::paths::{self, Mount, MountPolicy};
 use crate::pool::{self, SelectError, WorkerView};
+use crate::provider::{self, Probe};
 use crate::rlog;
-use crate::state::{McpKind, NetworkRecord, Resources, Session, SessionStatus, State, StateError, StateStore};
+use crate::state::{
+    McpKind, NetworkRecord, ProviderKind, Resources, Session, SessionStatus, State, StateError, StateStore,
+};
 use crate::util;
 
 /// Number of session logs kept in `~/.local/roc/logs`.
@@ -119,6 +122,7 @@ fn new_session(id: &str, plan: &Plan, w: &WorkerView) -> Session {
         binary: plan.agent.name().into(),
         image: plan.image.clone(),
         model: w.model.clone(),
+        key: w.key.clone(),
         worker: w.worker,
         container: format!("roc-{id}"),
         network: format!("roc-{id}"),
@@ -201,26 +205,52 @@ fn prune_logs(dir: &Path) {
 }
 
 /// Seeds keys into a JSON file in the agent home (creates it if missing).
+fn add_missing(doc: &mut Value, keys: &Value) -> bool {
+    let (Some(d), Some(k)) = (doc.as_object_mut(), keys.as_object()) else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, v) in k {
+        match d.get_mut(key) {
+            None => {
+                d.insert(key.clone(), v.clone());
+                changed = true;
+            }
+            Some(existing) if existing.is_object() && v.is_object() => changed |= add_missing(existing, v),
+            Some(_) => {}
+        }
+    }
+    changed
+}
+
 fn seed_json(path: &Path, keys: &Value) -> std::io::Result<()> {
     let mut doc: Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
-    let mut changed = false;
-    if let (Some(d), Some(k)) = (doc.as_object_mut(), keys.as_object()) {
-        for (key, v) in k {
-            if !d.contains_key(key) {
-                d.insert(key.clone(), v.clone());
-                changed = true;
-            }
-        }
-    }
-    if changed {
+    if add_missing(&mut doc, keys) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         util::write_private_file(path, serde_json::to_string_pretty(&doc).unwrap_or_default().as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Merges `table` into the TOML file at `path` (table wins; other keys kept).
+fn merge_toml_file(path: &Path, table: &toml::Table) -> std::io::Result<()> {
+    let mut doc: toml::Table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+    let before = doc.clone();
+    agents::merge_toml(&mut doc, table);
+    if doc != before || !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        util::write_private_file(path, doc.to_string().as_bytes())?;
     }
     Ok(())
 }
@@ -278,6 +308,7 @@ fn mcp_setup(
                     continue;
                 }
                 let ctx = SessionCtx {
+                    config_label: store.config_label(),
                     session_id: sess.id.clone(),
                     network: sess.network.clone(),
                     mounts: plan.mounts.clone(),
@@ -342,6 +373,19 @@ fn mcp_setup(
     }
 }
 
+/// The pseudo worker used with provider `none` (no lease, no model).
+fn agent_default_worker() -> WorkerView {
+    WorkerView {
+        worker: 0,
+        key: String::new(),
+        model: String::new(),
+        label: "agent".into(),
+        name: "the agent's own model".into(),
+        status: pool::WorkerStatus::Available,
+        session: None,
+    }
+}
+
 fn lease(
     store: &StateStore,
     args: &Args,
@@ -353,12 +397,20 @@ fn lease(
     let mut announced = false;
     loop {
         let st = store.load()?;
-        let probe = commands::probe_for(args, &st.config.ai.host, plan.token.as_deref());
+        if st.config.ai.provider == ProviderKind::None {
+            return store.update(|st| {
+                let w = agent_default_worker();
+                st.sessions.insert(id.to_string(), new_session(id, plan, &w));
+                Ok::<_, Error>((w, st.clone()))
+            });
+        }
+        let ai = &st.config.ai;
+        let probe = commands::probe_for(args, ai.provider, &ai.host, plan.token.as_deref());
         if let Probe::Unreachable(why) = &probe {
             if args.wait == 0 {
                 return Err(Error(format!(
-                    "LM Studio at {} is unreachable ({why}).\n  Start the server, check -ai-host, or pass -assume-available.",
-                    st.config.ai.host
+                    "{} at {} is unreachable ({why}).\n  Start the server, check -ai-host, or pass -assume-available.",
+                    ai.provider_name, ai.host
                 )));
             }
         }
@@ -430,23 +482,32 @@ fn assemble(
     tty: bool,
 ) -> Result<(agents::AgentLaunch, AgentRun)> {
     let ai = &st.config.ai;
-    let base_url = if ai.container_host.is_empty() {
-        lmstudio::container_url(&ai.host)?
+    let target = if ai.provider == ProviderKind::None {
+        None
     } else {
-        ai.container_host.trim_end_matches('/').to_string()
+        let base_url = if ai.container_host.is_empty() {
+            provider::container_url(&ai.host)?
+        } else {
+            ai.container_host.trim_end_matches('/').to_string()
+        };
+        Some(ModelTarget {
+            provider_id: ai.provider_id.clone(),
+            provider_name: ai.provider_name.clone(),
+            base_url,
+            model_id: w.model.clone(),
+            model_name: w.name.clone(),
+            limit: ai.models.get(&w.key).map(|m| m.limit).unwrap_or(ai.limit),
+            codex_wire_api: st.config.agent.codex_wire_api.clone(),
+        })
     };
-    let limit = ai.models.get(&w.model).map(|m| m.limit).unwrap_or(ai.limit);
+    let files = AgentFiles::new(&store.dir());
     let inputs = AgentInputs {
-        provider_id: ai.provider_id.clone(),
-        provider_name: ai.provider_name.clone(),
-        base_url,
-        model_id: w.model.clone(),
-        model_name: w.name.clone(),
-        limit,
+        target,
         mcp_token: mcp_token.to_string(),
         mcp: endpoints,
-        opencode_overrides: st.config.agent.opencode_overrides.clone(),
-        codex_wire_api: st.config.agent.codex_wire_api.clone(),
+        overlay: files.load_overlay(plan.agent)?,
+        instructions: files.instructions(),
+        workdir: plan.workdir.to_string_lossy().into_owned(),
         user_args: args.agent_args.clone(),
     };
     let launch = agents::build(plan.agent, &inputs)?;
@@ -457,6 +518,7 @@ fn assemble(
     secret_env.push(agents::MCP_TOKEN_ENV.into());
     secret_env.extend(plan.passthrough.iter().cloned());
     let run = AgentRun {
+        config_label: store.config_label(),
         session_id: sess.id.clone(),
         container: sess.container.clone(),
         network: sess.network.clone(),
@@ -482,13 +544,18 @@ fn assemble(
 }
 
 fn dry_run(st: &State, store: &StateStore, plan: &Plan, args: &Args) -> Result<i32> {
-    let probe = commands::probe_for(args, &st.config.ai.host, plan.token.as_deref());
-    let rows = pool::view(&st.config.ai, &st.live_leases(), &probe);
-    let w = match pool::select(&rows, args.worker) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("roc: note: {e}; showing worker 1");
-            rows.first().cloned().ok_or("no workers configured")?
+    let ai = &st.config.ai;
+    let w = if ai.provider == ProviderKind::None {
+        agent_default_worker()
+    } else {
+        let probe = commands::probe_for(args, ai.provider, &ai.host, plan.token.as_deref());
+        let rows = pool::view(ai, &st.live_leases(), &probe);
+        match pool::select(&rows, args.worker) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("roc: note: {e}; showing worker 1");
+                rows.first().cloned().ok_or("no workers configured")?
+            }
         }
     };
     let id = "dryrun000000";
@@ -528,7 +595,10 @@ fn dry_run(st: &State, store: &StateStore, plan: &Plan, args: &Args) -> Result<i
         println!("# mount:  {} ({})", m.path.display(), m.mode);
     }
     println!("# workdir: {}", plan.workdir.display());
-    println!("docker network create --label={LABEL_MANAGED}=true --label={LABEL_SESSION}={id} roc-{id}");
+    println!(
+        "docker network create --label={LABEL_MANAGED}=true --label={LABEL_CONFIG}={} --label={LABEL_SESSION}={id} roc-{id}",
+        store.config_label()
+    );
     let mut argv = vec!["docker".to_string()];
     argv.extend(docker::agent_run_args(&run));
     println!("{}", docker::shell_join(&argv));
@@ -579,6 +649,7 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
             Ok::<_, StateError>(())
         })?;
     }
+    AgentFiles::new(&store.dir()).ensure(&st.config.agent.opencode_overrides)?;
     if args.dry_run {
         return dry_run(&st, store, &plan, args);
     }
@@ -644,6 +715,7 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
             "network",
             "create",
             &format!("--label={LABEL_MANAGED}=true"),
+            &format!("--label={LABEL_CONFIG}={}", store.config_label()),
             &format!("--label={LABEL_SESSION}={id}"),
             &format!("--label={LABEL_ROLE}=network"),
             &sess.network,
@@ -712,6 +784,10 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
     }
     for (rel, keys) in &launch.home_seed {
         seed_json(&agent_home.join(rel), keys)?;
+    }
+    for (rel, table) in &launch.home_toml {
+        // Several sessions may start at once; serialise writers of shared files.
+        store.with_lock(|| merge_toml_file(&agent_home.join(rel), table))??;
     }
     store.update(|s| {
         if let Some(x) = s.sessions.get_mut(&id) {
@@ -802,6 +878,21 @@ mod tests {
     }
 
     #[test]
+    fn toml_file_merge_keeps_agent_written_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(".codex/config.toml");
+        merge_toml_file(&p, &toml::from_str("approval_policy = \"never\"").unwrap()).unwrap();
+        let mut existing = std::fs::read_to_string(&p).unwrap();
+        existing.push_str("\n[projects.\"/x\"]\ntrust_level = \"trusted\"\n");
+        std::fs::write(&p, existing).unwrap();
+        merge_toml_file(&p, &toml::from_str("model = \"m\"").unwrap()).unwrap();
+        let t: toml::Table = std::fs::read_to_string(&p).unwrap().parse().unwrap();
+        assert_eq!(t["approval_policy"].as_str(), Some("never"));
+        assert_eq!(t["model"].as_str(), Some("m"));
+        assert_eq!(t["projects"]["/x"]["trust_level"].as_str(), Some("trusted"));
+    }
+
+    #[test]
     fn seed_json_adds_missing_keys_only() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a/.claude.json");
@@ -814,6 +905,11 @@ mod tests {
         assert_eq!(v["hasCompletedOnboarding"], false, "existing values are respected");
         assert_eq!(v["y"], 2);
         assert_eq!(v["x"], 1);
+        seed_json(&p, &json!({"projects": {"/a": {"trusted": true}}})).unwrap();
+        seed_json(&p, &json!({"projects": {"/b": {"trusted": true}}})).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["projects"]["/a"]["trusted"], true);
+        assert_eq!(v["projects"]["/b"]["trusted"], true);
     }
 
     #[test]

@@ -10,41 +10,46 @@ use std::path::PathBuf;
 use crate::error::{Error, Result};
 use crate::paths;
 use crate::state::{MAX_WORKERS, State};
-use crate::{lmstudio, util};
+use crate::{provider, util};
 
 const AFTER_HELP: &str = "\
 EXAMPLES:
+  roc -init                      # guided setup
   roc -list
   roc -write-dir ~/friends_of/planning -read-dir ~/work
-  roc -ai-host http://192.168.128.2:17369/v1 -ai-model qwen3.8-27b -qty 4 \\
-      -binary opencode -write-dir \"~/friends_of/planning,~/friends_of/knowledge\" \\
-      -read-dir \"~/work,~/statuses\"
+  roc -ai-model qwen3.8-27b -qty 4 -binary opencode \\
+      -write-dir \"~/friends_of/planning,~/friends_of/knowledge\" -read-dir \"~/work,~/statuses\"
+  roc -provider ollama -ai-model qwen3:27b -qty 2
+  roc -provider openai -ai-host https://api.openai.com/v1 -ai-model gpt-5 -qty 8
   roc -binary codex -worker 3 -- --search
+  roc -agent-config -binary claudecode
   roc -cleanup
 
 Flags may be written with one dash (-list) or two (--list).
 Docs: https://github.com/playandprosper/roc";
 
-/// roc — run open code: launch a local-model AI coding agent inside a
-/// disposable Docker container with 1:1 host path mounts.
+/// roc — run open code: launch an AI coding agent (opencode, goose, Claude
+/// Code, Codex) inside a disposable Docker container with 1:1 host path mounts.
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "roc", version, about, after_help = AFTER_HELP)]
 pub struct Args {
-    /// LM Studio OpenAI-compatible base URL, e.g. http://127.0.0.1:1234/v1 (saved to state)
+    /// Model server: lmstudio | ollama | openai | none (saved to state)
+    #[arg(long, value_name = "KIND", env = "ROC_PROVIDER")]
+    pub provider: Option<String>,
+
+    /// OpenAI-compatible base URL, e.g. http://127.0.0.1:1234/v1 (saved to state)
     #[arg(long = "ai-host", value_name = "URL", env = "ROC_AI_HOST")]
     pub ai_host: Option<String>,
 
-    /// LM Studio API token (never saved; default: $ROC_AI_API_TOKEN)
+    /// API token for the model server (never saved; default: $ROC_AI_API_TOKEN)
     #[arg(long = "ai-api-token", value_name = "TOKEN", hide_env_values = true)]
     pub ai_api_token: Option<String>,
 
-    /// Base model id; workers are <model>, <model>:2, … (saved to state)
-    /// TODO: use default env value of ROC_AI_MODEL
+    /// Model id; LM Studio workers are <model>, <model>:2, … (saved to state)
     #[arg(long = "ai-model", value_name = "ID")]
     pub ai_model: Option<String>,
 
     /// Number of model workers in the pool (saved to state)
-    /// TODO: use default env value of ROC_NUM_AGENT_WORKERS
     #[arg(long, value_name = "N")]
     pub qty: Option<u32>,
 
@@ -53,22 +58,18 @@ pub struct Args {
     pub state: Option<String>,
 
     /// Agent: opencode | goose | claudecode | codex
-    /// TODO: use default env value of ROC_AGENT_BINARY
     #[arg(long, value_name = "NAME")]
     pub binary: Option<String>,
 
     /// Read-write directories (CSV, repeatable), mounted 1:1
-    /// TODO: use default env value of ROC_WRITE_DIRS
     #[arg(long = "write-dir", short = 'w', value_name = "CSV")]
     pub write_dir: Vec<String>,
 
     /// Read-only directories (CSV, repeatable), mounted 1:1
-    /// TODO: use default env value of ROC_READ_DIRS
     #[arg(long = "read-dir", short = 'r', value_name = "CSV")]
     pub read_dir: Vec<String>,
 
     /// Working directory inside the container (default: current dir if mounted)
-    /// TODO: default this to the current directory where called
     #[arg(long, value_name = "PATH")]
     pub workdir: Option<String>,
 
@@ -77,7 +78,6 @@ pub struct Args {
     pub image: Option<String>,
 
     /// Use this worker number (default: lowest available)
-    /// TODO: use default env value of ROC_AGENTS
     #[arg(long, value_name = "N")]
     pub worker: Option<u32>,
 
@@ -93,12 +93,11 @@ pub struct Args {
     #[arg(long, value_name = "CSV")]
     pub env: Vec<String>,
 
-    /// Show worker status: `Q #N running|available|offline`
+    /// Show worker status: `Q #N: running|available|offline`
     #[arg(long)]
     pub list: bool,
 
     /// With -list: machine readable JSON
-    /// TODO: add option for pretty print output
     #[arg(long)]
     pub json: bool,
 
@@ -106,9 +105,17 @@ pub struct Args {
     #[arg(long)]
     pub cleanup: bool,
 
-    /// Create the state file with defaults (with -force: back up and reset)
+    /// Guided setup: asks questions and writes the state file and agent configs
     #[arg(long)]
     pub init: bool,
+
+    /// With -init: accept every default without asking (also used when stdin is not a terminal)
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Show (and create) this config's agent files for -binary, and where they apply
+    #[arg(long = "agent-config")]
+    pub agent_config: bool,
 
     /// With -init: overwrite an existing state file (a backup is kept)
     #[arg(long)]
@@ -130,7 +137,7 @@ pub struct Args {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Do not probe LM Studio; treat every free worker as available
+    /// Do not probe the model server; treat every free worker as available
     #[arg(long = "assume-available")]
     pub assume_available: bool,
 
@@ -153,6 +160,7 @@ pub struct Args {
 
 /// Long flags that take a value (so their values are never rewritten).
 const VALUE_FLAGS: &[&str] = &[
+    "provider",
     "ai-host",
     "ai-api-token",
     "ai-model",
@@ -225,12 +233,20 @@ pub fn state_path(args: &Args) -> Result<PathBuf> {
     })
 }
 
-/// Applies `-ai-host`, `-ai-model`, `-qty` to the state. Returns true if changed.
+/// True when any pool-defining flag was given.
+pub fn has_ai_flags(args: &Args) -> bool {
+    args.provider.is_some() || args.ai_host.is_some() || args.ai_model.is_some() || args.qty.is_some()
+}
+
+/// Applies `-provider`, `-ai-host`, `-ai-model`, `-qty` to the state. Returns true if changed.
 pub fn apply_ai_flags(st: &mut State, args: &Args) -> Result<bool> {
     let ai = &mut st.config.ai;
     let before = ai.clone();
+    if let Some(p) = &args.provider {
+        ai.set_provider(p.parse()?);
+    }
     if let Some(h) = &args.ai_host {
-        lmstudio::validate_host(h)?;
+        provider::validate_host(h)?;
         ai.host = h.trim_end_matches('/').to_string();
     }
     if let Some(m) = &args.ai_model {
@@ -246,7 +262,7 @@ pub fn apply_ai_flags(st: &mut State, args: &Args) -> Result<bool> {
         }
         ai.qty = q;
     }
-    if args.ai_model.is_some() || args.qty.is_some() {
+    if args.ai_model.is_some() || args.qty.is_some() || ai.provider != before.provider {
         let existing = ai.models.clone();
         ai.models = ai.generate_models(&existing);
     }
@@ -386,14 +402,45 @@ mod tests {
         let a = Args {
             ai_model: Some("llama".into()),
             qty: Some(2),
-            ai_host: Some("http://192.168.128.2:17369/v1/".into()),
+            ai_host: Some("http://127.0.0.1:8080/v1/".into()),
             ..Default::default()
         };
         assert!(apply_ai_flags(&mut st, &a).unwrap());
-        assert_eq!(st.config.ai.host, "http://192.168.128.2:17369/v1");
+        assert_eq!(st.config.ai.host, "http://127.0.0.1:8080/v1");
         let ids: Vec<_> = st.config.ai.models.keys().cloned().collect();
         assert_eq!(ids, vec!["llama", "llama:2"]);
         assert!(!apply_ai_flags(&mut st, &a).unwrap(), "idempotent");
+        let ollama = Args {
+            provider: Some("ollama".into()),
+            ai_model: Some("qwen3:27b".into()),
+            ..Default::default()
+        };
+        assert!(apply_ai_flags(&mut st, &ollama).unwrap());
+        assert_eq!(
+            st.config.ai.host, "http://127.0.0.1:8080/v1",
+            "explicitly set host is kept"
+        );
+        let keys: Vec<_> = st.config.ai.models.keys().cloned().collect();
+        assert_eq!(keys, vec!["qwen3:27b", "qwen3:27b#2"]);
+        let mut fresh = State::default();
+        apply_ai_flags(
+            &mut fresh,
+            &Args {
+                provider: Some("ollama".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fresh.config.ai.host, "http://127.0.0.1:11434/v1",
+            "default host follows the provider"
+        );
+        assert_eq!(fresh.config.ai.provider_name, "Ollama");
+        let bogus = Args {
+            provider: Some("bogus".into()),
+            ..Default::default()
+        };
+        assert!(apply_ai_flags(&mut fresh, &bogus).is_err());
         let bad = Args {
             qty: Some(0),
             ..Default::default()
