@@ -1,13 +1,14 @@
 # Installing roc
 
 These steps take a Mac from nothing to `roc` dropping you into opencode, running against four
-copies of `qwen3.8-27b` in LM Studio. Linux works the same way: skip the Xcode parts and
-read "Docker Engine" wherever it says "Docker Desktop".
+copies of `qwen3.8-27b` in LM Studio. Ollama and hosted OpenAI-compatible APIs work too
+(section 4). Linux works the same way: skip the Xcode parts and read "Docker Engine"
+wherever it says "Docker Desktop".
 
 1. [Prerequisites](#1-prerequisites)
 2. [Install roc](#2-install-roc)
 3. [Build the agent image](#3-build-the-agent-image)
-4. [Set up LM Studio and the worker pool](#4-set-up-lm-studio-and-the-worker-pool)
+4. [Set up the model server and run `roc -init`](#4-set-up-the-model-server-and-run-roc--init)
 5. [Host MCP servers (browser, Xcode)](#5-host-mcp-servers-browser-xcode)
 6. [Remove host-installed agents](#6-remove-host-installed-agents)
 7. [Verify](#7-verify)
@@ -21,7 +22,7 @@ read "Docker Engine" wherever it says "Docker Desktop".
 |---|---|---|
 | macOS 14+ on Apple Silicon (or Linux x86_64/arm64) | host OS | `uname -sm` |
 | Docker Desktop 4.x, OrbStack, or Docker Engine 24+ | runs the agent container | `docker version` |
-| LM Studio 0.3.x+ with its server enabled (0.4+ recommended) | the local models | `curl http://127.0.0.1:1234/v1/models` |
+| A model server: LM Studio (0.4+ recommended), Ollama, or an OpenAI-compatible API | the models | `curl http://127.0.0.1:1234/v1/models` (LM Studio) or `curl http://127.0.0.1:11434/v1/models` (Ollama) |
 | Rust 1.85+ (only if building from source) | builds roc | `cargo --version` |
 | Node.js 18+ on the host (optional) | launches host MCP servers via `npx` | `npx --version` |
 | Xcode 16+ (optional, macOS) | XcodeBuildMCP / simulators | `xcodebuild -version` |
@@ -61,9 +62,9 @@ Tagged releases publish `roc-<version>-<target>.tar.gz` with a `.sha256` file fo
 (arm64, x86_64) and Linux (x86_64, arm64):
 
 ```sh
-shasum -a 256 -c roc-0.1.0-aarch64-apple-darwin.tar.gz.sha256
-tar xzf roc-0.1.0-aarch64-apple-darwin.tar.gz
-install -m 0755 roc-0.1.0-aarch64-apple-darwin/roc ~/.local/bin/roc
+shasum -a 256 -c roc-0.1.1-aarch64-apple-darwin.tar.gz.sha256
+tar xzf roc-0.1.1-aarch64-apple-darwin.tar.gz
+install -m 0755 roc-0.1.1-aarch64-apple-darwin/roc ~/.local/bin/roc
 xattr -d com.apple.quarantine ~/.local/bin/roc 2>/dev/null || true
 ```
 
@@ -95,9 +96,9 @@ make image-rebuild                                # no cache: picks up the newes
 The image is tagged `roc-agent:latest`. To use a different tag, pass `-image` or set
 `config.agent.image`.
 
-## 4. Set up LM Studio and the worker pool
+## 4. Set up the model server and run `roc -init`
 
-### 4.1 Load the model four times
+### 4.1 LM Studio: load the model once per worker
 
 In LM Studio, load `qwen3.8-27b` four times (the *Load model* button again, or the CLI below).
 LM Studio names the copies `qwen3.8-27b`, `qwen3.8-27b:2`, `qwen3.8-27b:3` and `qwen3.8-27b:4`.
@@ -105,9 +106,9 @@ Set each copy's context length to 256K (262 144) or whatever you choose.
 
 ```sh
 # LM Studio CLI (bundled with LM Studio; run `lms --help` for your version's options)
-lms server start --port 17369
+lms server start                                  # default port 1234
 for i in 1 2 3 4; do lms load qwen3.8-27b --context-length 256256 -y; done
-lms ps                        # should list four instances
+lms ps                                            # should list four instances
 ```
 
 > **Memory:** each copy needs ~16 GB of weights plus a KV cache that grows with context.
@@ -115,52 +116,62 @@ lms ps                        # should list four instances
 > (Q8 or Q4) in the model's load settings. If LM Studio refuses to load the fourth copy,
 > reduce the context or the quantity.
 
-If LM Studio runs on another Mac (the "Office Mac Studio"), enable *Developer → Settings →
-Serve on Local Network* there and note its address, e.g. `http://192.168.128.2:17369/v1`.
+If LM Studio runs on another machine, enable *Developer → Settings → Serve on Local Network*
+there and use that machine's address instead of `127.0.0.1` when `roc -init` asks.
 
-If you turned on *Require API token* in LM Studio, export the token. roc never writes it to disk:
+### 4.1 (alternative) Ollama
+
+```sh
+ollama pull qwen3:27b
+OLLAMA_NUM_PARALLEL=4 OLLAMA_CONTEXT_LENGTH=262144 ollama serve   # 4 = number of workers
+```
+
+With Ollama, every worker uses the same model id. `OLLAMA_NUM_PARALLEL` sets how many requests
+it serves at once.
+
+### 4.1 (alternative) A hosted OpenAI-compatible API, or the agent's own login
+
+Pick `openai` in `roc -init` and give the base URL (e.g. `https://api.openai.com/v1`). For
+`-provider none`, roc configures no model; log in inside the agent once
+(its login is kept in `~/.local/roc/home/<agent>`) or put a model in `~/.local/roc/agents/`.
+
+### 4.2 API token (only if the server needs one)
+
+roc never writes tokens to disk. Export the token in your shell profile:
 
 ```sh
 echo 'export ROC_AI_API_TOKEN="sk-lm-…"' >> ~/.zshrc
 ```
 
-### 4.2 Create the state file
+### 4.3 Run the guided setup
 
 ```sh
-roc -init                                         # writes ~/.local/roc/state.json
-roc -list -ai-host http://192.168.128.2:17369/v1 -ai-model qwen3.8-27b -qty 4
+roc -init
 ```
 
-Expected output, once all four copies are loaded:
+roc asks which server you use, where it runs, which model, how many instances, the
+context window, which directories to read from and write to, and which agent to start.
+It connects to the server to suggest answers, and checks every directory before saving.
+On LM Studio it counts the loaded copies for you. Re-run `roc -init` any time; your current
+values are the defaults. For scripts, use `roc -init -yes -provider ollama -ai-model qwen3:27b -qty 4`.
 
-```
+Afterwards:
+
+```sh
+roc -list
 Q #1: available
 Q #2: available
 Q #3: available
 Q #4: available
 ```
 
-Optionally rename the provider so it shows nicely in the agent UI. Edit
-`~/.local/roc/state.json`:
-
-```json
-"provider_id": "lmstudio-studio",
-"provider_name": "Office Mac Studio 256GB",
-```
-
-If the ids in LM Studio differ (for example `qwen3.8-27b-uncensored-mlx`), pass that as `-ai-model`.
-The keys under `config.ai.models` must match LM Studio's ids exactly. `roc -list -json` and
+If a worker shows `offline` although it is loaded, the model id differs (for example
+`qwen3.8-27b-uncensored-mlx`). Run `roc -init` again with the exact id. `roc -list -json` and
 `curl $HOST/models` show both sides.
 
-### 4.3 Save your usual mounts (optional)
-
-```sh
-roc -save -binary opencode \
-    -write-dir "~/friends_of/planning,~/friends_of/knowledge" \
-    -read-dir "~/work,~/statuses" -dry-run
-```
-
-After this, a bare `roc` uses those directories.
+`roc -init` also creates `~/.local/roc/agents/`, which holds the settings each agent starts
+with (never ask, keep going until `AGENTS.md` is satisfied). See
+[the README](README.md#agent-settings-and-the-never-ask-default).
 
 ## 5. Host MCP servers (browser, Xcode)
 
@@ -220,6 +231,7 @@ Inside the agent, try:
 
 - "Run `roc_session_info`": you should see your mounts, worker and network.
 - "Start an nginx container and fetch its homepage": tests the Docker MCP.
+- Start `roc` in a second terminal: it gets the next worker (`Q #2`) and its own container.
 - `touch ~/work/x` should fail with *Read-only file system* if `~/work` is a read dir.
 
 Quit the agent and check that nothing was left behind:

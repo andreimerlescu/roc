@@ -1,16 +1,16 @@
 [package]
 name = "roc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
-description = "roc (run open code): launch local-model AI coding agents (opencode, goose, claude code, codex) inside a disposable Docker container with 1:1 host path mounts and a policy-enforced MCP gateway."
+description = "roc (run opencode container): launch local-model AI coding agents (opencode, goose, claude code, codex) inside a disposable Docker container with 1:1 host path mounts and a policy-enforced MCP gateway."
 license = "Apache-2.0"
-repository = "https://github.com/playandprosper/roc"
-homepage = "https://github.com/playandprosper/roc"
+repository = "https://github.com/andreimerlescu/roc"
+homepage = "https://github.com/andreimerlescu/roc"
 readme = "README.md"
 keywords = ["opencode", "docker", "mcp", "lmstudio", "sandbox"]
 categories = ["command-line-utilities", "development-tools"]
-authors = ["Play and Prosper <https://github.com/playandprosper>"]
+authors = ["Play and Prosper <https://github.com/playandprosper>", "Andrei Merlescu <https://github.com/andreimerlescu>"]
 include = ["src/**", "docker/**", "schema/**", "Cargo.toml", "Cargo.lock", "README.md", "INSTALL.md", "LICENSE", "NOTICE"]
 
 [[bin]]

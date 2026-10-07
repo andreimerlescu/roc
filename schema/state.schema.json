@@ -2,39 +2,86 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/playandprosper/roc/main/schema/state.schema.json",
   "title": "roc state file",
-  "description": "~/.local/roc/state.json — durable configuration (config) plus runtime bookkeeping (sessions). Managed by roc under an exclusive lock; edit config by hand only while no roc session is running.",
+  "description": "~/.local/roc/state.json \u2014 durable configuration (config) plus runtime bookkeeping (sessions). Managed by roc under an exclusive lock; edit config by hand only while no roc session is running.",
   "type": "object",
-  "required": ["version"],
+  "required": [
+    "version"
+  ],
   "properties": {
-    "$schema": { "type": "string" },
-    "version": { "const": 1, "description": "Schema version. roc refuses to modify files from a newer version." },
-    "updated_at": { "type": "string", "format": "date-time" },
-    "config": { "$ref": "#/$defs/config" },
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "const": 1,
+      "description": "Schema version. roc refuses to modify files from a newer version."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "config": {
+      "$ref": "#/$defs/config"
+    },
     "sessions": {
       "type": "object",
       "description": "Live sessions keyed by session id. Written by roc; do not edit.",
-      "additionalProperties": { "$ref": "#/$defs/session" }
+      "additionalProperties": {
+        "$ref": "#/$defs/session"
+      }
     }
   },
   "$defs": {
     "limit": {
       "type": "object",
-      "required": ["context", "output"],
+      "required": [
+        "context",
+        "output"
+      ],
       "properties": {
-        "context": { "type": "integer", "minimum": 1, "description": "Context window in tokens" },
-        "output": { "type": "integer", "minimum": 1, "description": "Max output tokens" }
+        "context": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Context window in tokens"
+        },
+        "output": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Max output tokens"
+        }
       },
       "additionalProperties": false
     },
     "model": {
       "type": "object",
-      "required": ["name", "worker"],
+      "required": [
+        "name",
+        "worker"
+      ],
       "properties": {
-        "name": { "type": "string", "description": "Display name, e.g. \"Q #2 on Studio\"" },
-        "label": { "type": "string", "description": "Short label used by roc -list, e.g. \"Q #2\"" },
-        "worker": { "type": "integer", "minimum": 1, "description": "Unique worker number" },
-        "limit": { "$ref": "#/$defs/limit" },
-        "enabled": { "type": "boolean", "default": true }
+        "model": {
+          "type": "string",
+          "description": "Model id sent to the server when it differs from the key (Ollama/OpenAI workers share one id)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name, e.g. \"Q #2 Agent\""
+        },
+        "label": {
+          "type": "string",
+          "description": "Short label used by roc -list, e.g. \"Q #2\""
+        },
+        "worker": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Unique worker number"
+        },
+        "limit": {
+          "$ref": "#/$defs/limit"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
       },
       "additionalProperties": false
     },
@@ -44,128 +91,431 @@
         "ai": {
           "type": "object",
           "properties": {
-            "provider_id": { "type": "string", "default": "lmstudio" },
-            "provider_name": { "type": "string", "default": "LM Studio" },
-            "host": { "type": "string", "format": "uri", "default": "http://127.0.0.1:1234/v1", "description": "OpenAI-compatible base URL as seen from the host" },
-            "container_host": { "type": "string", "default": "", "description": "Base URL as seen from the container; empty = rewrite loopback to host.docker.internal" },
-            "api_token_env": { "type": "string", "default": "ROC_AI_API_TOKEN", "description": "Env var holding the LM Studio token (tokens are never stored here)" },
-            "model": { "type": "string", "default": "qwen3.8-27b" },
-            "qty": { "type": "integer", "minimum": 1, "maximum": 64, "default": 4 },
-            "name_template": { "type": "string", "default": "Q #{n} on Studio" },
-            "label_template": { "type": "string", "default": "Q #{n}" },
-            "limit": { "$ref": "#/$defs/limit" },
+            "provider": {
+              "enum": [
+                "lmstudio",
+                "ollama",
+                "openai",
+                "none"
+              ],
+              "default": "lmstudio",
+              "description": "Model server kind; none = agents use their own providers"
+            },
+            "provider_id": {
+              "type": "string",
+              "default": "lmstudio"
+            },
+            "provider_name": {
+              "type": "string",
+              "default": "LM Studio"
+            },
+            "host": {
+              "type": "string",
+              "default": "http://127.0.0.1:1234/v1",
+              "description": "OpenAI-compatible base URL as seen from the host (LM Studio http://127.0.0.1:1234/v1, Ollama http://127.0.0.1:11434/v1)"
+            },
+            "container_host": {
+              "type": "string",
+              "default": "",
+              "description": "Base URL as seen from the container; empty = rewrite loopback to host.docker.internal"
+            },
+            "api_token_env": {
+              "type": "string",
+              "default": "ROC_AI_API_TOKEN",
+              "description": "Env var holding the LM Studio token (tokens are never stored here)"
+            },
+            "model": {
+              "type": "string",
+              "default": "qwen3.8-27b"
+            },
+            "qty": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 4
+            },
+            "name_template": {
+              "type": "string",
+              "default": "{initial} #{n} Agent",
+              "description": "{n} = worker number, {initial} = model's first letter"
+            },
+            "label_template": {
+              "type": "string",
+              "default": "{initial} #{n}"
+            },
+            "limit": {
+              "$ref": "#/$defs/limit"
+            },
             "models": {
               "type": "object",
-              "description": "Worker pool keyed by exact LM Studio model id (base, base:2, base:3, …)",
-              "additionalProperties": { "$ref": "#/$defs/model" }
+              "description": "Worker pool keyed by worker key: LM Studio instance ids (base, base:2, \u2026) or base, base#2, \u2026 for other providers",
+              "additionalProperties": {
+                "$ref": "#/$defs/model"
+              }
             }
           }
         },
         "agent": {
           "type": "object",
           "properties": {
-            "binary": { "enum": ["opencode", "goose", "claude", "claudecode", "claude-code", "codex"], "default": "opencode" },
-            "image": { "type": "string", "default": "roc-agent:latest" },
-            "env_passthrough": { "type": "array", "items": { "type": "string" } },
-            "publish": { "type": "array", "items": { "type": "string", "pattern": "^[0-9]+(:[0-9]+)?(/(tcp|udp))?$" } },
-            "mount_gitconfig": { "type": "boolean", "default": true },
-            "extra_docker_args": { "type": "array", "items": { "type": "string", "pattern": "^-" } },
-            "opencode_overrides": { "type": "object", "description": "Deep-merged into the generated opencode.json" },
-            "codex_wire_api": { "enum": ["responses", "chat", "chat-completions"], "default": "responses" },
-            "memory": { "type": "string" },
-            "cpus": { "type": "string" }
+            "binary": {
+              "enum": [
+                "opencode",
+                "goose",
+                "claude",
+                "claudecode",
+                "claude-code",
+                "codex"
+              ],
+              "default": "opencode"
+            },
+            "image": {
+              "type": "string",
+              "default": "roc-agent:latest"
+            },
+            "env_passthrough": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "publish": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9]+(:[0-9]+)?(/(tcp|udp))?$"
+              }
+            },
+            "mount_gitconfig": {
+              "type": "boolean",
+              "default": true
+            },
+            "extra_docker_args": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^-"
+              }
+            },
+            "opencode_overrides": {
+              "description": "Deprecated (0.1.0): moved into agents/opencode.json on first run; ignored afterwards"
+            },
+            "codex_wire_api": {
+              "enum": [
+                "responses",
+                "chat",
+                "chat-completions"
+              ],
+              "default": "responses"
+            },
+            "memory": {
+              "type": "string"
+            },
+            "cpus": {
+              "type": "string"
+            }
           }
         },
         "mounts": {
           "type": "object",
           "properties": {
-            "read": { "type": "array", "items": { "type": "string" } },
-            "write": { "type": "array", "items": { "type": "string" } },
-            "denied": { "type": "array", "items": { "type": "string" }, "description": "Extra paths that may never be mounted (nor their parents)" }
+            "read": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "write": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "denied": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Extra paths that may never be mounted (nor their parents)"
+            }
           }
         },
         "mcp": {
           "type": "object",
           "properties": {
-            "bind": { "type": "string", "default": "auto" },
-            "port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0 },
-            "request_timeout_secs": { "type": "integer", "minimum": 5, "default": 600 },
+            "bind": {
+              "type": "string",
+              "default": "auto"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535,
+              "default": 0
+            },
+            "request_timeout_secs": {
+              "type": "integer",
+              "minimum": 5,
+              "default": 600
+            },
             "servers": {
               "type": "object",
-              "propertyNames": { "pattern": "^[A-Za-z0-9_-]+$" },
-              "additionalProperties": { "$ref": "#/$defs/mcpServer" }
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]+$"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/mcpServer"
+              }
             }
           }
         },
         "docker": {
           "type": "object",
           "properties": {
-            "max_containers": { "type": "integer", "minimum": 0, "default": 20 },
-            "max_images": { "type": "integer", "minimum": 0, "default": 20 },
-            "image_tag_prefix": { "type": "string", "default": "roc-local/" },
-            "allow_pull": { "type": "boolean", "default": true },
-            "allow_publish": { "type": "boolean", "default": true },
-            "publish_bind": { "type": "string", "default": "127.0.0.1" },
-            "remove_images_on_exit": { "type": "boolean", "default": true },
-            "command_timeout_secs": { "type": "integer", "minimum": 1, "default": 1800 }
+            "max_containers": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 20
+            },
+            "max_images": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 20
+            },
+            "image_tag_prefix": {
+              "type": "string",
+              "default": "roc-local/"
+            },
+            "allow_pull": {
+              "type": "boolean",
+              "default": true
+            },
+            "allow_publish": {
+              "type": "boolean",
+              "default": true
+            },
+            "publish_bind": {
+              "type": "string",
+              "default": "127.0.0.1"
+            },
+            "remove_images_on_exit": {
+              "type": "boolean",
+              "default": true
+            },
+            "command_timeout_secs": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1800
+            }
           }
         }
       }
     },
     "mcpServer": {
       "type": "object",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "properties": {
-        "type": { "enum": ["builtin", "host", "container", "remote"] },
-        "enabled": { "type": "boolean", "default": true },
-        "description": { "type": "string" },
-        "command": { "type": "string" },
-        "args": { "type": "array", "items": { "type": "string" } },
-        "env": { "type": "object", "additionalProperties": { "type": "string" } },
-        "url": { "type": "string", "format": "uri" },
-        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
-        "platforms": { "type": "array", "items": { "enum": ["macos", "linux"] } }
+        "type": {
+          "enum": [
+            "builtin",
+            "host",
+            "container",
+            "remote"
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "description": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "macos",
+              "linux"
+            ]
+          }
+        }
       },
       "allOf": [
-        { "if": { "properties": { "type": { "enum": ["host", "container"] } } }, "then": { "required": ["command"] } },
-        { "if": { "properties": { "type": { "const": "remote" } } }, "then": { "required": ["url"] } }
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "host",
+                  "container"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "command"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "remote"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "url"
+            ]
+          }
+        }
       ]
     },
     "session": {
       "type": "object",
-      "required": ["id", "pid", "hostname", "status", "model", "worker", "container", "network"],
+      "required": [
+        "id",
+        "pid",
+        "hostname",
+        "status",
+        "model",
+        "worker",
+        "container",
+        "network"
+      ],
       "properties": {
-        "id": { "type": "string" },
-        "pid": { "type": "integer" },
-        "hostname": { "type": "string" },
-        "started_at": { "type": "string" },
-        "status": { "enum": ["starting", "running", "cleaning"] },
-        "binary": { "type": "string" },
-        "image": { "type": "string" },
-        "model": { "type": "string" },
-        "worker": { "type": "integer" },
-        "container": { "type": "string" },
-        "network": { "type": "string" },
-        "gateway": { "type": "string" },
-        "workdir": { "type": "string" },
+        "id": {
+          "type": "string"
+        },
+        "pid": {
+          "type": "integer"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "starting",
+            "running",
+            "cleaning"
+          ]
+        },
+        "binary": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "worker": {
+          "type": "integer"
+        },
+        "container": {
+          "type": "string"
+        },
+        "network": {
+          "type": "string"
+        },
+        "gateway": {
+          "type": "string"
+        },
+        "workdir": {
+          "type": "string"
+        },
         "mounts": {
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
-              "path": { "type": "string" },
-              "source": { "type": "string" },
-              "mode": { "enum": ["ro", "rw"] }
+              "path": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "mode": {
+                "enum": [
+                  "ro",
+                  "rw"
+                ]
+              }
             }
           }
         },
         "resources": {
           "type": "object",
           "properties": {
-            "containers": { "type": "array", "items": { "type": "object", "required": ["id", "name"] } },
-            "images": { "type": "array", "items": { "type": "object", "required": ["id", "reference", "origin"] } },
-            "networks": { "type": "array", "items": { "type": "object", "required": ["id", "name"] } }
+            "containers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "name"
+                ]
+              }
+            },
+            "images": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "reference",
+                  "origin"
+                ]
+              }
+            },
+            "networks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "name"
+                ]
+              }
+            }
           }
+        },
+        "key": {
+          "type": "string",
+          "description": "Leased worker key (empty with provider none)"
         }
       }
     }

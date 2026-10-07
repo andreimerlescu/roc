@@ -4,22 +4,23 @@
   "updated_at": "2026-10-07T14:00:00Z",
   "config": {
     "ai": {
-      "provider_id": "lmstudio-studio",
-      "provider_name": "Office Mac Studio 256GB",
-      "host": "http://192.168.128.2:17369/v1",
+      "provider": "lmstudio",
+      "provider_id": "lmstudio",
+      "provider_name": "LM Studio",
+      "host": "http://127.0.0.1:1234/v1",
       "container_host": "",
       "api_token_env": "ROC_AI_API_TOKEN",
       "model": "qwen3.8-27b",
       "qty": 4,
-      "name_template": "Q #{n} on Studio",
-      "label_template": "Q #{n}",
+      "name_template": "{initial} #{n} Agent",
+      "label_template": "{initial} #{n}",
       "limit": {
         "context": 256256,
         "output": 32768
       },
       "models": {
         "qwen3.8-27b": {
-          "name": "Q #1 on Studio",
+          "name": "Q #1 Agent",
           "label": "Q #1",
           "worker": 1,
           "limit": {
@@ -29,7 +30,7 @@
           "enabled": true
         },
         "qwen3.8-27b:2": {
-          "name": "Q #2 on Studio",
+          "name": "Q #2 Agent",
           "label": "Q #2",
           "worker": 2,
           "limit": {
@@ -39,7 +40,7 @@
           "enabled": true
         },
         "qwen3.8-27b:3": {
-          "name": "Q #3 on Studio",
+          "name": "Q #3 Agent",
           "label": "Q #3",
           "worker": 3,
           "limit": {
@@ -49,7 +50,7 @@
           "enabled": true
         },
         "qwen3.8-27b:4": {
-          "name": "Q #4 on Studio",
+          "name": "Q #4 Agent",
           "label": "Q #4",
           "worker": 4,
           "limit": {
@@ -67,14 +68,6 @@
       "publish": [],
       "mount_gitconfig": true,
       "extra_docker_args": [],
-      "opencode_overrides": {
-        "agent": {
-          "build": {
-            "temperature": 1,
-            "top_p": 0.95
-          }
-        }
-      },
       "codex_wire_api": "responses",
       "memory": "",
       "cpus": ""
@@ -176,6 +169,7 @@
       "binary": "opencode",
       "image": "roc-agent:latest",
       "model": "qwen3.8-27b:2",
+      "key": "qwen3.8-27b:2",
       "worker": 2,
       "container": "roc-3f9a1c2b7d4e",
       "network": "roc-3f9a1c2b7d4e",
@@ -197,7 +191,7 @@
         "containers": [
           {
             "id": "9c1e\u2026",
-            "name": "roc-3f9a1c-postgres",
+            "name": "roc-3f9a1c2b7d4e-postgres",
             "image": "postgres:17",
             "role": "workload",
             "created_at": "2026-10-07T13:55:02Z"

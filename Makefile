@@ -4,7 +4,7 @@
 CARGO     ?= cargo
 DOCKER    ?= docker
 PREFIX    ?= $(HOME)/.local
-BINDIR    ?= $(HOME)/bin
+BINDIR    ?= $(PREFIX)/bin
 IMAGE     ?= roc-agent:latest
 VERSION   := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 TARGET_DIR?= target
@@ -65,8 +65,6 @@ image-playwright: ## Build the agent image with Playwright + Chromium
 .PHONY: image-rebuild
 image-rebuild: ## Rebuild the image without cache (pulls newest agents)
 	$(DOCKER) build --no-cache --pull --tag $(IMAGE) $(IMAGE_ARGS) docker
-
-# TODO: ensure that this binary builds on linux windows and macos/darwin for both amd64 and arm64
 
 .PHONY: setup
 setup: install image ## install + image + roc -init
