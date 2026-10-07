@@ -1,0 +1,42 @@
+[package]
+name = "roc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "roc (run open code): launch local-model AI coding agents (opencode, goose, claude code, codex) inside a disposable Docker container with 1:1 host path mounts and a policy-enforced MCP gateway."
+license = "Apache-2.0"
+repository = "https://github.com/playandprosper/roc"
+homepage = "https://github.com/playandprosper/roc"
+readme = "README.md"
+keywords = ["opencode", "docker", "mcp", "lmstudio", "sandbox"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Play and Prosper <https://github.com/playandprosper>"]
+include = ["src/**", "docker/**", "schema/**", "Cargo.toml", "Cargo.lock", "README.md", "INSTALL.md", "LICENSE", "NOTICE"]
+
+[[bin]]
+name = "roc"
+path = "src/main.rs"
+
+[lib]
+name = "roc"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4.3"
+libc = "0.2.190"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+signal-hook = "0.4.5"
+tiny_http = "0.12.0"
+toml = "1.1.6"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

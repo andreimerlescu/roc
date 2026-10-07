@@ -1,0 +1,8 @@
+roc (run opencode container)
+Copyright 2026 Play and Prosper
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+roc launches third-party software that is not distributed with it and is
+subject to its own license terms, including opencode, goose, Claude Code,
+Codex, LM Studio, Browser MCP, XcodeBuildMCP and Docker.
