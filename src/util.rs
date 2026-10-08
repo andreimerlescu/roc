@@ -1,7 +1,8 @@
-//! Small, dependency-free helpers: ids, timestamps, process liveness, logging.
+//! Small helpers: ids, timestamps, process liveness, file permissions,
+//! logging. Everything platform specific lives here.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,11 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Returns `n` random bytes from the OS CSPRNG, hex encoded.
 pub fn random_hex(n: usize) -> String {
     let mut buf = vec![0u8; n];
-    let filled = File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !filled {
-        // Extremely unlikely on Unix; fall back to time+pid mixing so ids stay unique.
+    if getrandom::fill(&mut buf).is_err() {
+        // Practically impossible; fall back to time+pid mixing so ids stay unique.
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -67,7 +65,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// True when a process with this pid exists (and we may or may not be able to signal it).
+/// True when a process with this pid exists.
+#[cfg(unix)]
 pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -80,64 +79,130 @@ pub fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// True when a process with this pid exists.
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
 /// The machine hostname (best effort).
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: buffer is valid for buf.len() bytes.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc != 0 {
-        return "unknown".into();
+    let h = gethostname::gethostname().to_string_lossy().into_owned();
+    if h.is_empty() { "unknown".into() } else { h }
+}
+
+/// The uid:gid the agent container runs as: yours on Unix (so files you
+/// create stay yours); a fixed non-root user on Windows.
+pub fn container_user() -> (u32, u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid never fail.
+        unsafe { (libc::getuid(), libc::getgid()) }
     }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+    #[cfg(not(unix))]
+    {
+        (1000, 1000)
+    }
 }
 
-/// Host uid/gid of the current process.
-pub fn uid_gid() -> (u32, u32) {
-    // SAFETY: getuid/getgid never fail.
-    unsafe { (libc::getuid(), libc::getgid()) }
-}
-
-/// The user's home directory from `$HOME`.
+/// The user's home directory (`$HOME`; `%USERPROFILE%` first on Windows).
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+    let order: &[&str] = if cfg!(windows) {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME"]
+    };
+    order
+        .iter()
+        .filter_map(std::env::var_os)
+        .find(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
-/// Locates an executable on `$PATH`.
+/// Executable file name candidates for `cmd` (`npx` → `npx.exe`, `npx.cmd`, … on Windows).
+fn exe_candidates(cmd: &str) -> Vec<String> {
+    if !cfg!(windows) || Path::new(cmd).extension().is_some() {
+        return vec![cmd.to_string()];
+    }
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    exts.split(';')
+        .filter(|e| !e.is_empty())
+        .map(|e| format!("{cmd}{}", e.to_ascii_lowercase()))
+        .collect()
+}
+
+/// Locates an executable on `PATH` (honouring `PATHEXT` on Windows).
 pub fn which(cmd: &str) -> Option<PathBuf> {
-    if cmd.contains('/') {
-        let p = PathBuf::from(cmd);
-        return is_executable(&p).then_some(p);
+    if cmd.contains('/') || cmd.contains(std::path::MAIN_SEPARATOR) {
+        return exe_candidates(cmd)
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| is_executable(p));
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join(cmd))
+        .flat_map(|dir| exe_candidates(cmd).into_iter().map(move |c| dir.join(c)))
         .find(|p| is_executable(p))
 }
 
 fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    let Ok(m) = std::fs::metadata(p) else { return false };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        m.is_file()
+    }
 }
 
-/// Creates a directory tree and restricts the leaf to 0700.
+/// Canonical path without Windows `\\?\` prefixes (Docker can't use those).
+pub fn canonicalize(p: &Path) -> std::io::Result<PathBuf> {
+    dunce::canonicalize(p)
+}
+
+/// Creates a directory tree; on Unix the leaf is restricted to 0700.
 pub fn ensure_private_dir(p: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(p)?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
-/// Writes a file with mode 0600 (truncating).
+fn private_options() -> OpenOptions {
+    #[allow(unused_mut)]
+    let mut o = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// Writes a file (mode 0600 on Unix), truncating.
 pub fn write_private_file(p: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(p)?;
+    let mut f = private_options().create(true).write(true).truncate(true).open(p)?;
     f.write_all(contents)?;
     f.sync_all()
 }
@@ -181,8 +246,7 @@ static LOG: Mutex<Option<File>> = Mutex::new(None);
 
 /// Directs `rlog!` output to `path` (append).
 pub fn init_log(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    let f = private_options().create(true).append(true).open(path)?;
     *LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     Ok(())
 }
@@ -250,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn which_finds_sh() {
         assert!(which("sh").is_some());
         assert!(which("definitely-not-a-real-binary-xyz").is_none());

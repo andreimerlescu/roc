@@ -93,7 +93,6 @@ impl StdioBridge {
     }
 
     fn spawn(&self) -> Result<Proc, String> {
-        use std::os::unix::process::CommandExt;
         let stderr = match &self.cfg.log_path {
             Some(p) => std::fs::OpenOptions::new()
                 .create(true)
@@ -107,8 +106,12 @@ impl StdioBridge {
         cmd.args(&self.cfg.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(stderr)
-            .process_group(0);
+            .stderr(stderr);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         for (k, v) in &self.cfg.env {
             cmd.env(k, v);
         }
@@ -127,7 +130,7 @@ impl StdioBridge {
             .cfg
             .roots
             .iter()
-            .map(|p| json!({"uri": format!("file://{}", p.display()), "name": p.display().to_string()}))
+            .map(|p| json!({"uri": crate::paths::file_uri(p), "name": p.display().to_string()}))
             .collect();
         let name = self.cfg.name.clone();
         std::thread::Builder::new()
@@ -266,6 +269,8 @@ fn route_from_child(v: Value, pending: &Pending, stdin: &Arc<Mutex<ChildStdin>>,
     }
 }
 
+/// Stops the child and everything it started (npx → node, …).
+#[cfg(unix)]
 fn kill_group(child: &mut Child) {
     let pgid = child.id() as i32;
     // SAFETY: signalling our own child's process group.
@@ -281,6 +286,18 @@ fn kill_group(child: &mut Child) {
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
+    let _ = child.wait();
+}
+
+/// Stops the child and everything it started (npx → node, …).
+#[cfg(not(unix))]
+fn kill_group(child: &mut Child) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
     let _ = child.wait();
 }
 
@@ -359,7 +376,7 @@ impl Drop for StdioBridge {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

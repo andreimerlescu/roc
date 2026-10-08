@@ -318,7 +318,7 @@ fn mcp_setup(
                         "worker": worker.label,
                         "worker_name": worker.name,
                         "model": worker.model,
-                        "workdir": plan.workdir,
+                        "workdir": paths::container_path(&plan.workdir),
                         "published_agent_ports": plan.publish,
                         "host_from_container": "host.docker.internal",
                     }),
@@ -329,16 +329,16 @@ fn mcp_setup(
                 );
             }
             McpKind::Host => {
-                if util::which(&srv.command).is_none() {
+                let Some(program) = util::which(&srv.command) else {
                     warnings.push(format!(
                         "MCP server {name}: `{}` not found on PATH; skipped",
                         srv.command
                     ));
                     continue;
-                }
+                };
                 let bridge = StdioBridge::new(BridgeConfig {
                     name: name.clone(),
-                    command: srv.command.clone(),
+                    command: program.to_string_lossy().into_owned(),
                     args: srv.args.clone(),
                     env: srv.env.iter().map(|(k, v)| (k.clone(), expand_env_refs(v))).collect(),
                     cwd: host_cwd.clone(),
@@ -507,11 +507,11 @@ fn assemble(
         mcp: endpoints,
         overlay: files.load_overlay(plan.agent)?,
         instructions: files.instructions(),
-        workdir: plan.workdir.to_string_lossy().into_owned(),
+        workdir: paths::container_path(&plan.workdir),
         user_args: args.agent_args.clone(),
     };
     let launch = agents::build(plan.agent, &inputs)?;
-    let (uid, gid) = util::uid_gid();
+    let (uid, gid) = util::container_user();
     let home = util::home_dir().unwrap_or_default();
     let gitconfig = Some(home.join(".gitconfig")).filter(|p| st.config.agent.mount_gitconfig && p.is_file());
     let mut secret_env = launch.token_env.clone();
@@ -608,15 +608,39 @@ fn dry_run(st: &State, store: &StateStore, plan: &Plan, args: &Args) -> Result<i
     Ok(0)
 }
 
+/// Signals that stop the agent container (terminal closed, `kill`, …).
+#[cfg(unix)]
+const TERM_SIGNALS: &[i32] = &[
+    signal_hook::consts::SIGTERM,
+    signal_hook::consts::SIGHUP,
+    signal_hook::consts::SIGQUIT,
+];
+/// Signals that stop the agent container (console closed, Ctrl-Break, …).
+#[cfg(windows)]
+const TERM_SIGNALS: &[i32] = &[signal_hook::consts::SIGTERM, signal_hook::consts::SIGBREAK];
+
 fn install_signal_flags() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>)> {
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    use signal_hook::consts::SIGINT;
     let term = Arc::new(AtomicBool::new(false));
     let int = Arc::new(AtomicBool::new(false));
-    for sig in [SIGTERM, SIGHUP, SIGQUIT] {
+    for &sig in TERM_SIGNALS {
         signal_hook::flag::register(sig, term.clone()).map_err(|e| e.to_string())?;
     }
     signal_hook::flag::register(SIGINT, int.clone()).map_err(|e| e.to_string())?;
     Ok((term, int))
+}
+
+/// Exit code of the docker client (128 + signal when killed by a signal).
+fn exit_code(s: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+    }
+    #[cfg(not(unix))]
+    {
+        s.code().unwrap_or(1)
+    }
 }
 
 /// Runs a full session. Returns the agent's exit code.
@@ -843,12 +867,7 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
         int.store(false, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(100));
     };
-    let code = status
-        .map(|s| {
-            use std::os::unix::process::ExitStatusExt;
-            s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
-        })
-        .unwrap_or(1);
+    let code = status.map(exit_code).unwrap_or(1);
     rlog!("agent exited with code {code}");
 
     // 9. Cleanup.
@@ -863,7 +882,7 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
     Ok(code)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

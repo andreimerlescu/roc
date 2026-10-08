@@ -883,10 +883,8 @@ impl StateStore {
     /// Identifier of this configuration, used to label its Docker resources
     /// (derived from the state file's absolute path).
     pub fn config_label(&self) -> String {
-        let p = self
-            .dir()
-            .canonicalize()
-            .map(|d| d.join(self.path.file_name().unwrap_or_default()));
+        let p = self.dir();
+        let p = util::canonicalize(&p).map(|d| d.join(self.path.file_name().unwrap_or_default()));
         let p = p.unwrap_or_else(|_| self.path.clone());
         util::fnv1a_hex(p.to_string_lossy().as_bytes())[..12].to_string()
     }
@@ -1074,9 +1072,12 @@ mod tests {
         let st = store.load().unwrap();
         assert_eq!(st.config.agent.binary, "goose");
         assert_eq!(st.extra["x_custom"]["keep"], true);
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]

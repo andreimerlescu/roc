@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end tests of the roc binary. Docker is replaced by a fake `docker`
 //! shell script (via `ROC_DOCKER`) and LM Studio by an in-process HTTP server,
 //! so these run anywhere without a daemon or a model.

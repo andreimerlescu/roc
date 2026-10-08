@@ -523,8 +523,19 @@ make help      # list targets
 make test      # unit + integration tests (no Docker or model server needed)
 make lint      # rustfmt --check + clippy -D warnings
 make image     # build the agent image
-make dist      # tarball of the release binary
+make dist      # tarball of the release binary for this machine
+make build-deps build-all   # all six release binaries into dist/
 ```
+
+`make build-all` produces `roc-darwin-arm64`, `roc-darwin-amd64`, `roc-linux-amd64`,
+`roc-linux-arm64` (static musl; `LINUX_LIBC=gnu` for glibc), `roc-amd64.exe` and
+`roc-arm64.exe`, plus `SHA256SUMS`. Your own platform is built with cargo and the others with
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild); `make build-deps` installs the Rust
+targets, zig and cargo-zigbuild. Each platform also has its own target:
+`make build-windows-amd64`, `build-windows-arm64`, `build-linux-amd64`, `build-linux-arm64`,
+`build-darwin-amd64` and `build-darwin-arm64`. Releases (tags `v*`) run the same command on CI.
+On Windows, host paths appear in the container as `/c/Users/...` (see
+[INSTALL.md](INSTALL.md#windows)).
 
 The integration tests in `tests/cli.rs` replace Docker with a shell script (`ROC_DOCKER`) and
 the model server with an in-process HTTP server on 127.0.0.1. They run a full session: lease, gateway, a fake "agent"

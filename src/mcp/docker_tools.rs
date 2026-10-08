@@ -13,7 +13,7 @@
 //!   flags; published ports bind to 127.0.0.1;
 //! * everything is removed when the session ends.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -210,7 +210,8 @@ impl DockerTools {
     /// Resolves a host path and checks it lies inside a session mount.
     /// Returns (canonical path, effective mode).
     pub fn check_path(&self, raw: &str) -> Result<(PathBuf, MountMode), String> {
-        let p = Path::new(raw);
+        let host = crate::paths::host_path(raw);
+        let p = host.as_path();
         if !p.is_absolute() {
             return Err(format!(
                 "{raw}: path must be absolute (paths are identical on host and in your container)"
@@ -219,7 +220,7 @@ impl DockerTools {
         if raw.contains(',') || raw.contains('"') || raw.chars().any(char::is_control) {
             return Err(format!("{raw}: unsupported character in path"));
         }
-        let canon = p.canonicalize().map_err(|e| format!("{raw}: {e}"))?;
+        let canon = util::canonicalize(p).map_err(|e| format!("{raw}: {e}"))?;
         self.ctx
             .mounts
             .iter()
@@ -666,7 +667,7 @@ impl DockerTools {
             self.ctx
                 .mounts
                 .iter()
-                .map(|m| json!({"path": m.path, "mode": m.mode}))
+                .map(|m| json!({"path": crate::paths::container_path(&m.path), "mode": m.mode}))
                 .collect::<Vec<_>>()
         );
         info["policy"] = json!({
@@ -850,7 +851,7 @@ impl ToolProvider for DockerTools {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::docker::mock::MockDocker;

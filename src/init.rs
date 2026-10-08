@@ -382,7 +382,7 @@ pub fn run(store: &StateStore, args: &Args, interactive: bool) -> Result<i32> {
     Ok(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Cursor;

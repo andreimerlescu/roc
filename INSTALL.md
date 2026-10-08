@@ -58,15 +58,35 @@ cargo install --locked --git https://github.com/playandprosper/roc
 
 ### Prebuilt binaries
 
-Tagged releases publish `roc-<version>-<target>.tar.gz` with a `.sha256` file for macOS
-(arm64, x86_64) and Linux (x86_64, arm64):
+Each release has six binaries and a `SHA256SUMS` file:
+
+| File | Platform |
+|---|---|
+| `roc-darwin-arm64` | macOS, Apple Silicon |
+| `roc-darwin-amd64` | macOS, Intel |
+| `roc-linux-amd64` | Linux x86_64 (static, musl) |
+| `roc-linux-arm64` | Linux arm64 (static, musl) |
+| `roc-amd64.exe` | Windows x86_64 |
+| `roc-arm64.exe` | Windows on Arm |
 
 ```sh
-shasum -a 256 -c roc-0.1.1-aarch64-apple-darwin.tar.gz.sha256
-tar xzf roc-0.1.1-aarch64-apple-darwin.tar.gz
-install -m 0755 roc-0.1.1-aarch64-apple-darwin/roc ~/.local/bin/roc
+shasum -a 256 -c SHA256SUMS --ignore-missing
+install -m 0755 roc-darwin-arm64 ~/.local/bin/roc
 xattr -d com.apple.quarantine ~/.local/bin/roc 2>/dev/null || true
 ```
+
+To build them yourself, run `make build-all`. It needs `make build-deps` once (the Rust
+targets, zig and cargo-zigbuild) and writes everything to `dist/`. Single platforms work too,
+for example `make build-linux-arm64`.
+
+### Windows
+
+Put `roc-amd64.exe` (or `roc-arm64.exe`) on your `PATH` as `roc.exe` and use Docker Desktop
+(WSL 2 backend). Everything works as on macOS with one difference: the container is Linux, so
+`C:\Users\me\proj` is mounted at `/c/Users/me/proj`. That's the drive letter in lower case and
+forward slashes, the same convention Docker Desktop and Git Bash use. roc translates paths
+in both directions, so host MCP servers and the Docker tools accept either form. State lives in
+`%USERPROFILE%\.local\roc\`. If you run roc inside WSL, use `roc-linux-amd64` there instead.
 
 Check it works:
 

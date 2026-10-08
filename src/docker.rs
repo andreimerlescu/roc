@@ -296,7 +296,7 @@ pub fn agent_run_args(r: &AgentRun) -> Vec<String> {
     for m in &r.mounts {
         a.push(format!("--mount={}", m.docker_mount_arg()));
     }
-    a.push(format!("--workdir={}", r.workdir.display()));
+    a.push(format!("--workdir={}", crate::paths::container_path(&r.workdir)));
     a.push(format!("--env=HOME={CONTAINER_HOME}"));
     for (k, v) in &r.env {
         a.push(format!("--env={k}={v}"));
@@ -431,11 +431,11 @@ pub fn sweep_orphans(
 
 /// Address the MCP gateway should bind to for `auto`.
 ///
-/// Docker Desktop (macOS) forwards `host.docker.internal` to the host's
-/// loopback, so 127.0.0.1 is both reachable and private. On Linux,
+/// Docker Desktop (macOS, Windows) forwards `host.docker.internal` to the
+/// host's loopback, so 127.0.0.1 is both reachable and private. On Linux,
 /// `host-gateway` is the docker0 bridge address, so we bind there.
 pub fn auto_bind_address(d: &dyn DockerCli) -> String {
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", windows)) {
         return "127.0.0.1".into();
     }
     d.ok(&[
@@ -508,7 +508,7 @@ pub mod mock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::mock::MockDocker;
     use super::*;

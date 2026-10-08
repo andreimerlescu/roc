@@ -3,6 +3,10 @@
 //! Every mount is mapped 1:1: the path the user typed (after `~` expansion and
 //! lexical normalisation) is the path inside the container. The *source* of the
 //! bind mount is the canonical host path, so symlinked directories still work.
+//!
+//! On Windows the container is Linux, so `C:\Users\me\p` appears as
+//! `/c/Users/me/p` (the convention Docker Desktop and Git Bash use);
+//! [`container_path`] and [`host_path`] convert between the two.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -43,12 +47,76 @@ impl Mount {
         let mut s = format!(
             "type=bind,source={},target={}",
             self.source.display(),
-            self.path.display()
+            container_path(&self.path)
         );
         if self.mode == MountMode::Ro {
             s.push_str(",readonly");
         }
         s
+    }
+}
+
+/// `C:\Users\me\p` → `/c/Users/me/p`. Paths without a drive letter only
+/// get their separators converted.
+pub fn windows_to_container(p: &str) -> String {
+    let p = p.strip_prefix(r"\\?\").unwrap_or(p);
+    let b = p.as_bytes();
+    let (head, rest) = if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        (format!("/{}", (b[0] as char).to_ascii_lowercase()), &p[2..])
+    } else {
+        (String::new(), p)
+    };
+    let rest = rest.replace('\\', "/");
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        if head.is_empty() { "/".into() } else { head }
+    } else if rest.starts_with('/') {
+        format!("{head}{rest}")
+    } else {
+        format!("{head}/{rest}")
+    }
+}
+
+/// `/c/Users/me/p` → `C:\Users\me\p`; `None` for paths without a drive.
+pub fn container_to_windows(p: &str) -> Option<String> {
+    let rest = p.strip_prefix('/')?;
+    let mut parts = rest.splitn(2, '/');
+    let drive = parts.next()?;
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let tail = parts.next().unwrap_or("").replace('/', "\\");
+    Some(format!("{}:\\{tail}", drive.to_ascii_uppercase()))
+}
+
+/// The path inside the (Linux) container for a host path.
+pub fn container_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if cfg!(windows) {
+        windows_to_container(&s)
+    } else {
+        s.into_owned()
+    }
+}
+
+/// The host path for a path inside the container.
+pub fn host_path(c: &str) -> PathBuf {
+    if cfg!(windows) {
+        container_to_windows(c)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(c))
+    } else {
+        PathBuf::from(c)
+    }
+}
+
+/// `file://` URI for a host path.
+pub fn file_uri(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
     }
 }
 
@@ -98,13 +166,16 @@ impl MountPolicy {
         .iter()
         .map(|p| home.join(p))
         .collect();
+        if cfg!(windows) {
+            protected.push(home.join("AppData"));
+        }
         protected.push(normalize_lexical(state_dir));
         protected.push(PathBuf::from("/var/run/docker.sock"));
         protected.push(PathBuf::from("/run/docker.sock"));
         for e in extra_denied {
             protected.push(normalize_lexical(&expand_tilde(e, home)));
         }
-        let system = [
+        let unix_system = [
             "/etc",
             "/bin",
             "/sbin",
@@ -119,7 +190,18 @@ impl MountPolicy {
             "/Library",
             "/private/etc",
             "/Applications",
-        ]
+        ];
+        let windows_system = [
+            r"C:\Windows",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+        ];
+        let system = if cfg!(windows) {
+            &windows_system[..]
+        } else {
+            &unix_system[..]
+        }
         .iter()
         .map(PathBuf::from)
         .collect();
@@ -132,7 +214,7 @@ impl MountPolicy {
 
     /// Returns a reason when `p` must not be mounted.
     pub fn check(&self, p: &Path) -> Option<String> {
-        if p == Path::new("/") {
+        if p.parent().is_none() {
             return Some("the filesystem root cannot be mounted".into());
         }
         if p == self.home {
@@ -216,9 +298,7 @@ fn validate_one(raw: &str, mode: MountMode, cwd: &Path, policy: &MountPolicy) ->
     if !meta.is_dir() {
         return Err(format!("{}: not a directory", path.display()));
     }
-    let source = path
-        .canonicalize()
-        .map_err(|e| format!("{}: {}", path.display(), describe_io(&e)))?;
+    let source = crate::util::canonicalize(&path).map_err(|e| format!("{}: {}", path.display(), describe_io(&e)))?;
     for candidate in [&path, &source] {
         if let Some(reason) = policy.check(candidate) {
             return Err(format!("{}: {reason}", path.display()));
@@ -325,7 +405,7 @@ pub fn pick_workdir(cwd: &Path, mounts: &[Mount], explicit: Option<&Path>) -> Re
         .ok_or_else(|| "no directories to mount".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -516,5 +596,46 @@ mod tests {
             pick_workdir(Path::new("/x"), &mounts, Some(Path::new("/r/a"))).unwrap(),
             PathBuf::from("/r/a")
         );
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+
+    #[test]
+    fn windows_paths_map_to_container_paths() {
+        assert_eq!(windows_to_container(r"C:\Users\me\proj"), "/c/Users/me/proj");
+        assert_eq!(windows_to_container(r"D:\work\"), "/d/work");
+        assert_eq!(windows_to_container(r"\\?\C:\Users\me"), "/c/Users/me");
+        assert_eq!(windows_to_container("C:/Users/me"), "/c/Users/me");
+        assert_eq!(windows_to_container(r"C:\"), "/c");
+        assert_eq!(windows_to_container("/already/posix"), "/already/posix");
+    }
+
+    #[test]
+    fn container_paths_map_back_to_windows() {
+        assert_eq!(
+            container_to_windows("/c/Users/me/proj").as_deref(),
+            Some(r"C:\Users\me\proj")
+        );
+        assert_eq!(container_to_windows("/d").as_deref(), Some(r"D:\"));
+        assert_eq!(container_to_windows("/usr/lib"), None);
+        assert_eq!(container_to_windows("relative/x"), None);
+        let back = container_to_windows(&windows_to_container(r"E:\a b\c")).unwrap();
+        assert_eq!(back, r"E:\a b\c");
+    }
+
+    #[test]
+    fn platform_mapping_and_uris() {
+        if cfg!(windows) {
+            assert_eq!(container_path(Path::new(r"C:\x")), "/c/x");
+            assert_eq!(host_path("/c/x"), PathBuf::from(r"C:\x"));
+        } else {
+            assert_eq!(container_path(Path::new("/Users/a/p")), "/Users/a/p");
+            assert_eq!(host_path("/Users/a/p"), PathBuf::from("/Users/a/p"));
+        }
+        assert_eq!(file_uri(Path::new("/Users/a/p")), "file:///Users/a/p");
+        assert_eq!(file_uri(Path::new(r"C:\Users\a")), "file:///C:/Users/a");
     }
 }
