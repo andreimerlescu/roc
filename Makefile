@@ -4,7 +4,7 @@
 CARGO     ?= cargo
 DOCKER    ?= docker
 PREFIX    ?= $(HOME)/.local
-BINDIR    ?= $(PREFIX)/bin
+BINDIR    ?= $(HOME)/bin
 IMAGE     ?= roc-agent:latest
 VERSION   := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 TARGET_DIR?= target

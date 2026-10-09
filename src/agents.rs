@@ -285,6 +285,7 @@ pub fn opencode_config(i: &AgentInputs) -> Value {
     let mut cfg = json!({
         "$schema": "https://opencode.ai/config.json",
         "autoupdate": false,
+        "plugin": ["context-mode"],
         "share": "disabled",
         "permission": {
             "*": "allow",

@@ -47,6 +47,7 @@ pub fn default_overlay(agent: Agent) -> String {
     let v = match agent {
         Agent::OpenCode => json!({
             "$schema": "https://opencode.ai/config.json",
+            "plugin": ["context-mode"],
             "permission": {
                 "*": "allow",
                 "read": "allow",
