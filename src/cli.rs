@@ -283,13 +283,10 @@ pub fn main_with_args<I: IntoIterator<Item = OsString>>(argv: I) -> i32 {
             return if e.use_stderr() { 2 } else { 0 };
         }
     };
-    match crate::commands::dispatch(args) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("roc: {e}");
-            1
-        }
-    }
+    crate::commands::dispatch(args).unwrap_or_else(|e| {
+        eprintln!("roc: {e}");
+        1
+    })
 }
 
 #[cfg(test)]

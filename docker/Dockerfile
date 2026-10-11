@@ -11,7 +11,7 @@
 #   GOOSE_VERSION     goose release tag, e.g. v1.9.0      (default: stable)
 #   WITH_PLAYWRIGHT   1 to add @playwright/mcp + headless Chromium
 
-FROM node:22-bookworm-slim
+FROM node:22-trixie-slim
 
 ARG GO_VERSION=
 ARG OPENCODE_VERSION=latest
@@ -22,7 +22,7 @@ ARG WITH_PLAYWRIGHT=0
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="roc-agent" \
-      org.opencontainers.image.source="https://github.com/playandprosper/roc" \
+      org.opencontainers.image.source="https://github.com/andreimerlescu/roc" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -31,28 +31,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash bzip2 ca-certificates curl file git jq less make nano openssh-client \
-        procps ripgrep fd-find tree unzip xz-utils zip \
-        build-essential pkg-config libssl-dev \
-        python3 python3-pip python3-venv \
+        procps ripgrep fd-find tree unzip xz-utils zip libgtk-4-dev \
+        libwebkitgtk-6.0-dev libxcb1 libdbus-1-3 build-essential \
+        pkg-config libssl-dev libjpeg-dev python3 python3-pip python3-venv \
         php-cli php-mbstring php-xml php-curl \
-        libxcb1 libdbus-1-3 \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
-# Go
 RUN set -eux; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     v="${GO_VERSION:-$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1 | sed 's/^go//')}"; \
     curl -fsSL "https://go.dev/dl/go${v}.linux-${arch}.tar.gz" | tar -C /usr/local -xz; \
     /usr/local/go/bin/go version
 
-# Rust (toolchain read-only in /usr/local; per-user CARGO_HOME at runtime)
 RUN set -eux; \
     curl -fsSL https://sh.rustup.rs | CARGO_HOME=/usr/local/cargo sh -s -- -y --no-modify-path --profile minimal --component rustfmt,clippy; \
     chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     /usr/local/cargo/bin/cargo --version
 
-# Agents
 RUN set -eux; \
     npm install -g --no-fund --no-audit \
         "opencode-ai@${OPENCODE_VERSION}" \
@@ -63,7 +59,6 @@ RUN set -eux; \
     opencode --version; codex --version; claude --version; goose --version; \
     npm cache clean --force
 
-# Optional: headless browser MCP inside the container
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN set -eux; \
     if [ "${WITH_PLAYWRIGHT}" = "1" ]; then \
@@ -73,7 +68,6 @@ RUN set -eux; \
         npm cache clean --force; \
     fi
 
-# Arbitrary host uids: let the entrypoint register the user.
 RUN chmod 0666 /etc/passwd /etc/group && mkdir -p /home/roc /roc/session && chmod 0777 /home/roc
 
 COPY entrypoint.sh /usr/local/bin/roc-entrypoint

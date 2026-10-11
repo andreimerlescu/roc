@@ -58,7 +58,7 @@ build: ## Debug build
 
 .PHONY: release
 release: ## Optimised build (target/release/roc)
-	$(CARGO) build --release --locked
+	$(CARGO) build --release
 
 .PHONY: build-all
 build-all: $(addprefix build-,$(PLATFORMS)) ## Cross-compile all six binaries into dist/ (+ SHA256SUMS)
