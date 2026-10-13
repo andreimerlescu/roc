@@ -90,8 +90,12 @@ pub enum McpEndpoint {
         command: String,
         /// Args.
         args: Vec<String>,
-        /// Env.
+        /// Literal env.
         env: Vec<(String, String)>,
+        /// Env vars forwarded by name from the agent's environment (secrets:
+        /// roc passes them into the container by name and every agent config
+        /// refers to them instead of containing the value).
+        env_refs: Vec<String>,
     },
 }
 
@@ -273,10 +277,19 @@ pub fn opencode_config(i: &AgentInputs) -> Value {
                 let h = headers_json(*gateway_auth, format!("Bearer {{env:{MCP_TOKEN_ENV}}}"), headers);
                 json!({"type": "remote", "url": url, "enabled": true, "headers": h, "timeout": 120000})
             }
-            McpEndpoint::Stdio { command, args, env, .. } => {
+            McpEndpoint::Stdio {
+                command,
+                args,
+                env,
+                env_refs,
+                ..
+            } => {
                 let mut cmd = vec![command.clone()];
                 cmd.extend(args.iter().cloned());
-                let env: Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                let mut env: Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                for k in env_refs {
+                    env.insert(k.clone(), json!(format!("{{env:{k}}}")));
+                }
                 json!({"type": "local", "command": cmd, "environment": env, "enabled": true, "timeout": 120000})
             }
         };
@@ -295,7 +308,7 @@ pub fn opencode_config(i: &AgentInputs) -> Value {
             "webfetch": "allow",
             "external_directory": "allow",
             "doom_loop": "allow",
-            "question": "deny"
+            "question": "allow"
         },
         "instructions": [session_path(INSTRUCTIONS_FILE)],
         "mcp": mcp
@@ -358,8 +371,17 @@ pub fn claude_mcp_config(i: &AgentInputs) -> Value {
                 let h = headers_json(*gateway_auth, format!("Bearer {}", i.mcp_token), headers);
                 json!({"type": "http", "url": url, "headers": h})
             }
-            McpEndpoint::Stdio { command, args, env, .. } => {
-                let env: Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+            McpEndpoint::Stdio {
+                command,
+                args,
+                env,
+                env_refs,
+                ..
+            } => {
+                let mut env: Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                for k in env_refs {
+                    env.insert(k.clone(), json!(format!("${{{k}}}")));
+                }
                 json!({"type": "stdio", "command": command, "args": args, "env": env})
             }
         };
@@ -502,10 +524,19 @@ pub fn codex_overrides(i: &AgentInputs) -> Vec<String> {
                 }
                 toml_inline(&pairs)
             }
-            McpEndpoint::Stdio { command, args, env, .. } => {
+            McpEndpoint::Stdio {
+                command,
+                args,
+                env,
+                env_refs,
+                ..
+            } => {
                 let mut pairs = vec![("command", toml_str(command)), ("args", toml_array(args))];
                 if !env.is_empty() {
                     pairs.push(("env", toml_map(env)));
+                }
+                if !env_refs.is_empty() {
+                    pairs.push(("env_vars", toml_array(env_refs)));
                 }
                 toml_inline(&pairs)
             }
@@ -572,10 +603,11 @@ pub fn goose_config(i: &AgentInputs) -> Value {
                 command,
                 args,
                 env,
+                env_refs,
             } => {
                 let env: Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                 json!({"type": "stdio", "name": name, "description": format!("{name} (container)"), "cmd": command,
-                       "args": args, "envs": env, "env_keys": [], "enabled": true, "timeout": 300})
+                       "args": args, "envs": env, "env_keys": env_refs, "enabled": true, "timeout": 300})
             }
         };
         ext.insert(e.name().to_string(), v);
@@ -682,6 +714,14 @@ mod tests {
                     command: "playwright-mcp".into(),
                     args: vec!["--headless".into()],
                     env: vec![],
+                    env_refs: vec![],
+                },
+                McpEndpoint::Stdio {
+                    name: "figma".into(),
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "figma-developer-mcp".into()],
+                    env: vec![("MODE".into(), "x".into())],
+                    env_refs: vec!["FIGMA_API_KEY".into()],
                 },
             ],
             overlay: Overlay::empty(agent),
@@ -862,6 +902,25 @@ mod tests {
         assert!(!l.env.iter().any(|(k, _)| k == "GOOSE_PROVIDER" || k == "GOOSE_MODEL"));
         let cfg: Value = serde_json::from_str(&l.files[0].1).unwrap();
         assert_eq!(cfg["GOOSE_PROVIDER"], "anthropic");
+    }
+
+    #[test]
+    fn secrets_are_forwarded_by_reference_for_every_agent() {
+        let oc = opencode_config(&inputs(Agent::OpenCode));
+        assert_eq!(
+            oc["mcp"]["figma"]["environment"]["FIGMA_API_KEY"],
+            "{env:FIGMA_API_KEY}"
+        );
+        assert_eq!(oc["mcp"]["figma"]["environment"]["MODE"], "x");
+        let cl = claude_mcp_config(&inputs(Agent::Claude));
+        assert_eq!(cl["mcpServers"]["figma"]["env"]["FIGMA_API_KEY"], "${FIGMA_API_KEY}");
+        let cx = codex_overrides(&inputs(Agent::Codex));
+        let figma = cx.iter().find(|o| o.starts_with("mcp_servers.figma=")).unwrap();
+        assert!(figma.contains(r#"env_vars = ["FIGMA_API_KEY"]"#), "{figma}");
+        let (_, v) = figma.split_once('=').unwrap();
+        assert!(toml::from_str::<toml::Table>(&format!("x = {v}")).is_ok());
+        let g = goose_config(&inputs(Agent::Goose));
+        assert_eq!(g["extensions"]["figma"]["env_keys"], json!(["FIGMA_API_KEY"]));
     }
 
     #[test]

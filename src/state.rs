@@ -449,8 +449,27 @@ pub enum McpKind {
     Host,
     /// A stdio server launched inside the agent container.
     Container,
-    /// A remote streamable-HTTP server the agent connects to directly.
+    /// A remote streamable-HTTP server. The agent connects directly, unless a
+    /// header references a host secret (`${VAR}`): then roc's gateway proxies
+    /// it so the secret never enters the container.
     Remote,
+    /// A streamable-HTTP server reachable from the host only (for example a
+    /// running Wails app on 127.0.0.1:9099 or Figma's desktop server). roc's
+    /// gateway forwards requests to it.
+    Proxy,
+}
+
+impl McpKind {
+    /// Lowercase name, as written in the state file.
+    pub fn name(self) -> &'static str {
+        match self {
+            McpKind::Builtin => "builtin",
+            McpKind::Host => "host",
+            McpKind::Container => "container",
+            McpKind::Remote => "remote",
+            McpKind::Proxy => "proxy",
+        }
+    }
 }
 
 /// One MCP server definition.
@@ -468,41 +487,69 @@ pub struct McpServer {
     /// Executable (host/container kinds).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
-    /// Arguments.
+    /// Arguments. `${VAR}` is expanded from the host environment and from
+    /// roc's own variables (`${ROC_WORKDIR}`, `${ROC_SESSION_ID}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// Extra environment.
+    /// Extra environment. A value of exactly `${NAME}` forwards the host
+    /// variable `NAME` by reference (it is never written to a config file).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    /// URL (remote kind).
+    /// URL (remote and proxy kinds).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
-    /// HTTP headers (remote kind). Values may reference `${ENV}` on the host.
+    /// HTTP headers (remote and proxy kinds). Values may reference `${ENV}` on
+    /// the host; a header whose variables are unset is left out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     /// Restrict to these host platforms (`macos`, `linux`); empty = all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
+    /// Host environment variables the server cannot work without. When one is
+    /// unset the server is skipped for the session (with a warning).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_env: Vec<String>,
+    /// How to use the server, added to the agent's session instructions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hint: String,
 }
 
 impl McpServer {
-    fn host(cmd: &str, args: &[&str], desc: &str, platforms: &[&str], enabled: bool) -> Self {
+    /// An empty server of `kind` (fill in the rest with struct update syntax).
+    pub fn of(kind: McpKind) -> Self {
         McpServer {
-            kind: McpKind::Host,
-            enabled,
-            description: desc.into(),
-            command: cmd.into(),
-            args: args.iter().map(|s| s.to_string()).collect(),
+            kind,
+            enabled: true,
+            description: String::new(),
+            command: String::new(),
+            args: vec![],
             env: BTreeMap::new(),
             url: String::new(),
             headers: BTreeMap::new(),
-            platforms: platforms.iter().map(|s| s.to_string()).collect(),
+            platforms: vec![],
+            requires_env: vec![],
+            hint: String::new(),
         }
     }
 
     /// True if the server applies to the current host OS.
     pub fn supports_this_platform(&self) -> bool {
         self.platforms.is_empty() || self.platforms.iter().any(|p| p == current_platform())
+    }
+
+    /// Required host variables that are not set (or empty).
+    pub fn missing_env(&self) -> Vec<String> {
+        self.requires_env
+            .iter()
+            .filter(|v| std::env::var(v).map(|x| x.is_empty()).unwrap_or(true))
+            .cloned()
+            .collect()
+    }
+
+    /// True when a header references a host variable, so the gateway must
+    /// inject it on the host instead of handing it to the agent.
+    pub fn has_secret_headers(&self) -> bool {
+        self.headers.values().any(|v| v.contains("${"))
     }
 }
 
@@ -515,82 +562,9 @@ pub fn current_platform() -> &'static str {
     }
 }
 
-/// The MCP servers shipped in a fresh state file.
+/// The MCP servers shipped in a fresh state file (from the built-in catalog).
 pub fn default_mcp_servers() -> BTreeMap<String, McpServer> {
-    let mut m = BTreeMap::new();
-    m.insert(
-        "docker".into(),
-        McpServer {
-            kind: McpKind::Builtin,
-            enabled: true,
-            description: "roc's policy-enforced Docker server: create/run/exec/remove only containers, images and networks this session created".into(),
-            command: String::new(),
-            args: vec![],
-            env: BTreeMap::new(),
-            url: String::new(),
-            headers: BTreeMap::new(),
-            platforms: vec![],
-        },
-    );
-    m.insert(
-        "browsermcp".into(),
-        McpServer::host(
-            "npx",
-            &["-y", "@browsermcp/mcp@latest"],
-            "Drive your real host browser via the Browser MCP extension",
-            &[],
-            true,
-        ),
-    );
-    m.insert(
-        "xcodebuildmcp".into(),
-        McpServer::host(
-            "npx",
-            &["-y", "xcodebuildmcp@latest", "mcp"],
-            "Build, run and test Xcode projects; boot/control iOS simulators; UI automation and screenshots",
-            &["macos"],
-            true,
-        ),
-    );
-    m.insert(
-        "xcode".into(),
-        McpServer::host(
-            "xcrun",
-            &["mcpbridge"],
-            "Xcode 26.3+ built-in MCP (enable Settings > Intelligence > MCP in Xcode)",
-            &["macos"],
-            false,
-        ),
-    );
-    m.insert(
-        "playwright".into(),
-        McpServer {
-            kind: McpKind::Container,
-            enabled: false,
-            description: "Headless Chromium inside the container (build image with WITH_PLAYWRIGHT=1)".into(),
-            command: "playwright-mcp".into(),
-            args: vec!["--headless".into(), "--isolated".into(), "--no-sandbox".into()],
-            env: BTreeMap::new(),
-            url: String::new(),
-            headers: BTreeMap::new(),
-            platforms: vec![],
-        },
-    );
-    m.insert(
-        "context7".into(),
-        McpServer {
-            kind: McpKind::Remote,
-            enabled: false,
-            description: "Up-to-date library documentation (requires internet)".into(),
-            command: String::new(),
-            args: vec![],
-            env: BTreeMap::new(),
-            url: "https://mcp.context7.com/mcp".into(),
-            headers: BTreeMap::new(),
-            platforms: vec![],
-        },
-    );
-    m
+    crate::mcp::catalog::defaults()
 }
 
 /// Policy applied by the built-in Docker MCP server.
@@ -808,8 +782,11 @@ impl State {
                 McpKind::Host | McpKind::Container if s.command.is_empty() => {
                     return Err(format!("config.mcp.servers.{name}: command is required"));
                 }
-                McpKind::Remote if s.url.is_empty() => {
+                McpKind::Remote | McpKind::Proxy if s.url.is_empty() => {
                     return Err(format!("config.mcp.servers.{name}: url is required"));
+                }
+                McpKind::Remote | McpKind::Proxy if url::Url::parse(&s.url).is_err() => {
+                    return Err(format!("config.mcp.servers.{name}: invalid url {:?}", s.url));
                 }
                 _ => {}
             }

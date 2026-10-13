@@ -51,6 +51,51 @@ pub fn format_rfc3339(secs: i64) -> String {
     )
 }
 
+/// Parses `YYYY-MM-DDTHH:MM:SSZ` (what roc writes) into unix seconds.
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+// Howard Hinnant's civil-to-days algorithm.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Short human duration: `45s`, `12m`, `3h05m`, `2d04h`.
+pub fn human_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// Seconds since the unix epoch.
+pub fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 // Howard Hinnant's days-to-civil algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -238,6 +283,83 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP. roc talks to model servers (usually local) and remote MCP servers
+// (usually on the internet). Behind a corporate proxy only the latter must
+// use it, so the proxy variables are honoured for public hosts only.
+// ---------------------------------------------------------------------------
+
+fn env_any(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .find(|v| !v.trim().is_empty())
+}
+
+/// True for hosts that are never reached through a proxy: loopback, private
+/// and link-local addresses, `localhost`, `*.local` and `host.docker.internal`.
+pub fn is_local_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") || h == "host.docker.internal" {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00
+        }
+        Err(_) => false,
+    }
+}
+
+fn no_proxy_matches(host: &str, no_proxy: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    no_proxy.split(',').map(|e| e.trim().to_ascii_lowercase()).any(|e| {
+        if e.is_empty() {
+            return false;
+        }
+        if e == "*" {
+            return true;
+        }
+        let e = e.split(':').next().unwrap_or("").trim_start_matches("*.");
+        let e = e.trim_start_matches('.');
+        host == e || host.ends_with(&format!(".{e}"))
+    })
+}
+
+/// The proxy URL to use for `target` (from `HTTPS_PROXY`/`HTTP_PROXY`/
+/// `ALL_PROXY`, honouring `NO_PROXY`), or `None` for a direct connection.
+pub fn proxy_for(target: &str) -> Option<String> {
+    let u = url::Url::parse(target).ok()?;
+    let host = u.host_str()?;
+    if is_local_host(host) {
+        return None;
+    }
+    if env_any(&["NO_PROXY", "no_proxy"]).is_some_and(|np| no_proxy_matches(host, &np)) {
+        return None;
+    }
+    if u.scheme() == "https" {
+        env_any(&["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])
+    } else {
+        env_any(&["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
+    }
+}
+
+/// An HTTP agent for `target` with the given timeouts and, when the
+/// environment asks for one, a proxy (TLS trusts the OS certificate store).
+pub fn http_agent(target: &str, connect: std::time::Duration, total: std::time::Duration) -> ureq::Agent {
+    let mut b = ureq::AgentBuilder::new().timeout_connect(connect).timeout(total);
+    if let Some(p) = proxy_for(target) {
+        match ureq::Proxy::new(&p) {
+            Ok(proxy) => b = b.proxy(proxy),
+            Err(e) => crate::rlog!("ignoring proxy {p:?}: {e}"),
+        }
+    }
+    b.build()
+}
+
+// ---------------------------------------------------------------------------
 // File logger. While the agent TUI owns the terminal, roc must never write to
 // stdout/stderr, so everything after launch goes to a per-session log file.
 // ---------------------------------------------------------------------------
@@ -273,6 +395,40 @@ mod tests {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(format_rfc3339(1_791_374_580), "2026-10-07T12:03:00Z");
+    }
+
+    #[test]
+    fn rfc3339_round_trip_and_durations() {
+        for t in [0, 951_782_400, 1_791_374_580, 4_102_444_800] {
+            assert_eq!(parse_rfc3339(&format_rfc3339(t)), Some(t));
+        }
+        assert_eq!(parse_rfc3339("x"), None);
+        assert_eq!(parse_rfc3339("2026-13-07T12:03:00Z"), None);
+        assert_eq!(human_duration(5), "5s");
+        assert_eq!(human_duration(720), "12m");
+        assert_eq!(human_duration(3 * 3600 + 300), "3h05m");
+        assert_eq!(human_duration(2 * 86_400 + 4 * 3600), "2d04h");
+    }
+
+    #[test]
+    fn proxies_are_used_for_public_hosts_only() {
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("192.168.1.20"));
+        assert!(is_local_host("[::1]"));
+        assert!(is_local_host("studio.local"));
+        assert!(is_local_host("host.docker.internal"));
+        assert!(!is_local_host("mcp.context7.com"));
+        assert!(!is_local_host("8.8.8.8"));
+        assert!(no_proxy_matches("api.github.com", "localhost, .github.com"));
+        assert!(no_proxy_matches("github.com", "github.com:443"));
+        assert!(no_proxy_matches("x.corp", "*"));
+        assert!(no_proxy_matches("a.example.com", "*.example.com"));
+        assert!(!no_proxy_matches("notgithub.com", "github.com"));
+        assert_eq!(
+            proxy_for("http://127.0.0.1:1234/v1"),
+            None,
+            "local model servers are direct"
+        );
     }
 
     #[test]

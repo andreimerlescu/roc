@@ -322,8 +322,10 @@
             "builtin",
             "host",
             "container",
-            "remote"
-          ]
+            "remote",
+            "proxy"
+          ],
+          "description": "builtin: inside roc; host: stdio on the host, bridged; container: stdio in the agent container; remote: hosted HTTP (via the gateway when a header uses ${VAR}); proxy: HTTP on the host loopback, forwarded by the gateway"
         },
         "enabled": {
           "type": "boolean",
@@ -339,13 +341,15 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "description": "${VAR}, ${ROC_WORKDIR} and ${ROC_SESSION_ID} are expanded"
         },
         "env": {
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "description": "A value of exactly ${NAME} forwards the host variable NAME by reference"
         },
         "url": {
           "type": "string",
@@ -355,7 +359,8 @@
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "description": "Values may reference ${VAR} on the host; such servers go through the gateway and a header with an unset variable is left out"
         },
         "platforms": {
           "type": "array",
@@ -365,6 +370,17 @@
               "linux"
             ]
           }
+        },
+        "requires_env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Host variables the server cannot work without; it is skipped when one is unset"
+        },
+        "hint": {
+          "type": "string",
+          "description": "How to use the server, added to the agent's session instructions"
         }
       },
       "allOf": [
@@ -389,7 +405,10 @@
           "if": {
             "properties": {
               "type": {
-                "const": "remote"
+                "enum": [
+                  "remote",
+                  "proxy"
+                ]
               }
             }
           },

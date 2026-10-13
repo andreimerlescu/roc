@@ -4,6 +4,42 @@ All notable changes to roc are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-10-13
+
+### Added
+- `roc -kill N`: stop the session at `-list` position N (also `Q#2`, a session id, `all`, or a
+  comma-separated mix). The agent container is stopped so the owning roc cleans up as on a normal
+  exit; a dead or stuck owner (or `-force`) is cleaned up directly. PIDs are never signalled.
+- `roc -ps`: running sessions with position, worker, agent, id, uptime and working directory.
+- MCP catalog of 20 vetted servers: docker, browsermcp, chrome-devtools, playwright,
+  playwright-host, context7, shadcn, figma, figma-desktop, nextjs, wails, wails-app, gopls,
+  xcodebuildmcp, xcode, database (DBHub), memory, sequential-thinking, brave-search, github.
+- Stacks: `roc -stack frontend|nextjs|wails|ios|data|research|github`; `roc -init` asks for them.
+- `roc -mcp`: `list`, `catalog`, `stacks`, `add` (catalog names or `NAME=URL`,
+  `NAME=host:CMD …`, `NAME=container:CMD …`), `set KEY=VALUE`, `enable`, `disable`, `rm`, `info`,
+  and `test`, which starts servers and lists their tools.
+- `-with-mcp` / `-without-mcp` for one session.
+- `roc -doctor`: Docker, the agent image and its features, the model server, dead sessions and
+  every enabled MCP server (secrets, host tools, image features, proxy reachability), each with a fix.
+- MCP server type `proxy`: HTTP servers on the host's loopback (a running Wails app, Figma
+  desktop), forwarded by the gateway.
+- Each session's instructions list the MCP servers that started, how to use them and which ports
+  are published.
+- MCP 2026-07-28: `server/discover`, clients that skip `initialize`, and `Mcp-Method` header
+  validation. Older stdio and HTTP servers are initialised on such clients' behalf.
+- The agent image includes `uv`/`uvx` and `gopls`, and labels its features for `-doctor`.
+
+### Changed
+- Remote MCP servers whose headers reference `${VAR}` go through the gateway, which adds the
+  header on the host; the token never enters the container. Headers with unset variables are left out.
+- Container MCP servers get `${NAME}` secrets forwarded by name (`{env:NAME}` for opencode,
+  `${NAME}` for Claude Code, `env_vars` for Codex, `env_keys` for goose) instead of by value.
+- Host server args and env expand `${VAR}`, `${ROC_WORKDIR}` and `${ROC_SESSION_ID}`.
+- Servers whose `requires_env` is unset are skipped with a note instead of failing at runtime.
+- HTTP to remote hosts honours `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` and `NO_PROXY` (never for
+  local or private hosts), and TLS uses the system trust store.
+- `context7` carries an optional `Authorization: Bearer ${CONTEXT7_API_KEY}` header.
+
 ## [0.1.2] - 2026-10-07
 
 ### Added

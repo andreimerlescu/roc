@@ -1,6 +1,6 @@
 [package]
 name = "roc"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "roc (run opencode container): launch AI coding agents (opencode, goose, claude code, codex) against LM Studio, Ollama or any OpenAI-compatible model inside a disposable Docker container with 1:1 host path mounts and a policy-enforced MCP gateway."
@@ -32,7 +32,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 signal-hook = "0.4.5"
 tiny_http = "0.12.0"
 toml = "1.1.6"
-ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+ureq = { version = "2", default-features = false, features = ["json", "tls", "native-certs"] }
 url = "2.5.8"
 
 [dev-dependencies]

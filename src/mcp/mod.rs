@@ -10,16 +10,31 @@
 //! * `host` servers (browsermcp, XcodeBuildMCP, Xcode's mcpbridge, …) are stdio
 //!   processes roc launches **on the host** and bridges over HTTP, so the agent
 //!   can drive the host browser and iOS simulators without any host access of
-//!   its own.
+//!   its own;
+//! * `proxy` servers (and `remote` servers with secret headers) are HTTP MCP
+//!   servers roc forwards to from the host, adding the secret headers there.
+//!
+//! The gateway speaks both protocol generations: the 2025 handshake
+//! (`initialize`, sessions) and the stateless 2026-07-28 revision, where
+//! clients may skip `initialize` and ask `server/discover` instead.
 
 pub mod bridge;
+pub mod catalog;
 pub mod docker_tools;
 pub mod gateway;
+pub mod plan;
+pub mod proxy;
+pub mod vars;
 
 use serde_json::{Value, json};
 
 /// MCP protocol versions roc can speak (newest first).
-pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub const PROTOCOL_VERSIONS: &[&str] = &["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Version answered when a client asks for one roc does not know, and used
+/// when roc initialises an upstream server on a stateless client's behalf.
+/// It is the version every current agent and stdio server accepts.
+pub const LEGACY_DEFAULT_VERSION: &str = "2025-06-18";
 
 /// JSON-RPC error codes.
 pub mod code {
@@ -61,7 +76,7 @@ pub fn err_response(id: &Value, code: i64, message: impl Into<String>) -> Value 
 pub fn negotiate_version(requested: Option<&str>) -> &'static str {
     requested
         .and_then(|r| PROTOCOL_VERSIONS.iter().find(|v| **v == r).copied())
-        .unwrap_or(PROTOCOL_VERSIONS[1])
+        .unwrap_or(LEGACY_DEFAULT_VERSION)
 }
 
 /// One MCP endpoint behind the gateway.
@@ -99,7 +114,9 @@ impl<P: ToolProvider> McpHandler for ToolServer<P> {
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         let method = msg["method"].as_str().unwrap_or_default();
         Some(match method {
-            "initialize" => {
+            // `server/discover` is the 2026-07-28 replacement for the
+            // handshake; it returns the same description of the server.
+            "initialize" | "server/discover" => {
                 let v = negotiate_version(params.get("protocolVersion").and_then(Value::as_str));
                 let mut r = json!({
                     "protocolVersion": v,
@@ -169,6 +186,7 @@ mod tests {
     #[test]
     fn version_negotiation() {
         assert_eq!(negotiate_version(Some("2025-03-26")), "2025-03-26");
+        assert_eq!(negotiate_version(Some("2026-07-28")), "2026-07-28");
         assert_eq!(negotiate_version(Some("1999-01-01")), "2025-06-18");
         assert_eq!(negotiate_version(None), "2025-06-18");
     }
@@ -204,6 +222,11 @@ mod tests {
             .handle(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope"}}))
             .unwrap();
         assert_eq!(unknown["error"]["code"], code::INVALID_PARAMS);
+        let d = s
+            .handle(json!({"jsonrpc":"2.0","id":6,"method":"server/discover","params":{}}))
+            .unwrap();
+        assert_eq!(d["result"]["serverInfo"]["name"], "echo");
+        assert_eq!(d["result"]["protocolVersion"], LEGACY_DEFAULT_VERSION);
         let nf = s.handle(json!({"jsonrpc":"2.0","id":5,"method":"sampling/x"})).unwrap();
         assert_eq!(nf["error"]["code"], code::METHOD_NOT_FOUND);
     }

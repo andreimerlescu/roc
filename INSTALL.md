@@ -9,7 +9,7 @@ wherever it says "Docker Desktop".
 2. [Install roc](#2-install-roc)
 3. [Build the agent image](#3-build-the-agent-image)
 4. [Set up the model server and run `roc -init`](#4-set-up-the-model-server-and-run-roc--init)
-5. [Host MCP servers (browser, Xcode)](#5-host-mcp-servers-browser-xcode)
+5. [MCP servers (stacks, browser, Wails, Xcode)](#5-mcp-servers-stacks-browser-wails-xcode)
 6. [Remove host-installed agents](#6-remove-host-installed-agents)
 7. [Verify](#7-verify)
 8. [Upgrade and uninstall](#8-upgrade-and-uninstall)
@@ -193,9 +193,27 @@ If a worker shows `offline` although it is loaded, the model id differs (for exa
 with (never ask, keep going until `AGENTS.md` is satisfied). See
 [the README](README.md#agent-settings-and-the-never-ask-default).
 
-## 5. Host MCP servers (browser, Xcode)
+## 5. MCP servers (stacks, browser, Wails, Xcode)
 
-These servers run **on your Mac**, started by roc only while a session is active. They need
+Pick the tools your agents get with a stack (`roc -init` also asks):
+
+```sh
+roc -mcp stacks                  # frontend, nextjs, wails, ios, data, research, github
+roc -stack frontend              # or several: roc -stack wails,github
+roc -doctor                      # says what each enabled server still needs
+```
+
+Secrets are read from your shell environment and never stored. Export the ones your stacks use
+in `~/.zshrc`, for example:
+
+```sh
+export FIGMA_API_KEY="figd_…"                     # figma
+export GITHUB_PERSONAL_ACCESS_TOKEN="github_pat_…"  # github
+export CONTEXT7_API_KEY="ctx7sk-…"                # context7 (optional, raises limits)
+export DATABASE_URL="postgres://user:pass@db:5432/app"  # database
+```
+
+Host servers run **on your Mac**, started by roc only while a session is active. Most need
 Node.js (`npx`) on the host.
 
 ### Browser MCP
@@ -217,10 +235,29 @@ Node.js (`npx`) on the host.
 2. Set `config.mcp.servers.xcode.enabled` to `true` in the state file. roc runs `xcrun mcpbridge`.
    Xcode may ask you to allow the connection the first time.
 
+### Wails v3 (desktop apps)
+
+1. Install the Wails CLI on the host: `go install github.com/wailsapp/wails/v3/cmd/wails3@latest`
+   and check it with `wails3 doctor`.
+2. `roc -stack wails`. The `wails` server runs `wails3 mcp` on your Mac, limited to the session's
+   working directory, so builds and dev mode produce native apps.
+3. To let the agent drive the running app, start dev mode with the in-app MCP server:
+   `WAILS_MCP=1 wails3 dev` in a terminal on your Mac. The `wails-app` server reaches it at
+   `127.0.0.1:9099` through roc's gateway. Keep `WAILS_MCP` out of your shell profile:
+   builds inherit it, and production builds must not include the in-app server.
+
 ### Turning servers on and off
 
-Edit `config.mcp.servers.<name>.enabled` in `~/.local/roc/state.json`, or disable all of them
-for one session with `-no-mcp`. See the README for adding your own servers.
+```sh
+roc -mcp                         # list, with the reason a server would be skipped
+roc -mcp enable xcode            # or disable / rm
+roc -mcp add github              # anything from `roc -mcp catalog`
+roc -mcp test                    # start every enabled server and list its tools
+roc -without-mcp browsermcp      # leave one out for this session
+roc -no-mcp                      # no MCP at all for this session
+```
+
+See the README for adding your own servers.
 
 ## 6. Remove host-installed agents
 
@@ -241,7 +278,9 @@ history, and goose sessions.
 ## 7. Verify
 
 ```sh
+roc -doctor                                 # Docker, image, models, MCP servers, secrets
 roc -list                                   # pool status
+roc -mcp test                               # every enabled MCP server answers
 cd ~/friends_of/planning
 roc -dry-run                                # shows the docker command and generated config
 roc                                         # drops you into opencode
@@ -252,6 +291,7 @@ Inside the agent, try:
 - "Run `roc_session_info`": you should see your mounts, worker and network.
 - "Start an nginx container and fetch its homepage": tests the Docker MCP.
 - Start `roc` in a second terminal: it gets the next worker (`Q #2`) and its own container.
+  `roc -ps` in a third terminal shows both; `roc -kill 2` stops the second one and frees `Q #2`.
 - `touch ~/work/x` should fail with *Read-only file system* if `~/work` is a read dir.
 
 Quit the agent and check that nothing was left behind:

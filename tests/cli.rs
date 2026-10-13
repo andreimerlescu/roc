@@ -297,7 +297,7 @@ case "$1" in
       done
       echo "$name $model" >> "$FAKE_RUNS"
       n=0
-      while [ ! -f "$FAKE_HOLD" ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done
+      while [ ! -f "$FAKE_HOLD" ] && [ ! -f "$FAKE_HOLD.$name" ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done
       exit 0
     fi
     sd=""
@@ -312,6 +312,9 @@ case "$1" in
       "$url" > "$FAKE_AGENT_OUT"
     printf '\ntoken=%s\n' "$ROC_AI_API_TOKEN" >> "$FAKE_AGENT_OUT"
     exit 7 ;;
+  stop|rm)
+    # Stopping or removing a held agent container lets its `docker run` return.
+    if [ -n "$FAKE_HOLD" ]; then for a in "$@"; do last=$a; done; touch "$FAKE_HOLD.$last"; fi ;;
 esac
 exit 0
 "#;
@@ -501,6 +504,12 @@ fn init_without_a_terminal_writes_defaults_and_agent_files() {
     assert_eq!(v["config"]["ai"]["host"], "http://127.0.0.1:11434/v1");
     assert_eq!(v["config"]["ai"]["models"]["qwen3:27b#3"]["model"], "qwen3:27b");
     // stdin is not a terminal here, so plain -init never blocks on questions either
+    let o = roc(&e, &["-init", "-stack", "ios,data"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&e.state).unwrap()).unwrap();
+    assert_eq!(v["config"]["mcp"]["servers"]["database"]["enabled"], true);
+    assert_eq!(v["config"]["mcp"]["servers"]["xcode"]["enabled"], true);
+    assert_eq!(roc(&e, &["-init", "-stack", "nope"], &[]).status.code(), Some(1));
     let o = roc(&e, &["-init"], &[]);
     assert!(o.status.success());
     assert!(stdout(&o).contains("Updated"));
@@ -662,4 +671,192 @@ fn four_workers_run_four_separate_sessions_at_once() {
     assert_eq!(st["sessions"], json!({}));
     let creates = calls.lines().filter(|l| l.starts_with("network create")).count();
     assert_eq!(creates, 4, "one network per session");
+}
+
+fn wait_for_runs(runs: &Path, n: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let got = std::fs::read_to_string(runs).map(|s| s.lines().count()).unwrap_or(0);
+        if got >= n {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "only {got} agents started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn kill_stops_the_session_at_a_list_position() {
+    let e = env();
+    roc(&e, &["-init", "-yes", "-qty", "3"], &[]);
+    let fake = write_fake_docker(&e.home);
+    let log = e.home.join("docker.log");
+    let runs = e.home.join("runs.log");
+    let hold = e.home.join("release");
+    let envs: Vec<(String, String)> = vec![
+        ("ROC_DOCKER".into(), fake.display().to_string()),
+        ("FAKE_DOCKER_LOG".into(), log.display().to_string()),
+        ("FAKE_RUNS".into(), runs.display().to_string()),
+        ("FAKE_HOLD".into(), hold.display().to_string()),
+    ];
+    let env_refs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let spawn = || {
+        let mut c = Command::new(BIN);
+        c.args(["-assume-available", "-no-mcp"])
+            .current_dir(&e.proj)
+            .env("HOME", &e.home)
+            .env("ROC_STATE", &e.state)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in &envs {
+            c.env(k, v);
+        }
+        c.spawn().unwrap()
+    };
+    let first = spawn();
+    wait_for_runs(&runs, 1);
+    let second = spawn();
+    wait_for_runs(&runs, 2);
+
+    let ps = roc(&e, &["-ps"], &[]);
+    let out = stdout(&ps);
+    assert!(out.starts_with("POS  WORKER  AGENT"), "{out}");
+    assert!(
+        out.contains("\n1    Q #1    opencode") && out.contains("\n2    Q #2    opencode"),
+        "{out}"
+    );
+
+    let k = roc(&e, &["-kill", "2"], &env_refs);
+    assert!(k.status.success(), "{}", stderr(&k));
+    assert!(stdout(&k).contains("stopped Q #2"), "{}", stdout(&k));
+    assert_eq!(
+        stdout(&roc(&e, &["-list", "-assume-available"], &[])),
+        "Q #1: running\nQ #2: available\nQ #3: available\n"
+    );
+    let out = second.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let missing = roc(&e, &["-kill", "3"], &env_refs);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("nothing is running"), "{}", stderr(&missing));
+
+    // -force removes a session without waiting for its owner.
+    let k = roc(&e, &["-kill", "Q#1", "-force"], &env_refs);
+    assert!(k.status.success(), "{}", stderr(&k));
+    assert!(stdout(&k).contains("removed Q #1"), "{}", stdout(&k));
+    let out = first.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let st: Value = serde_json::from_str(&std::fs::read_to_string(&e.state).unwrap()).unwrap();
+    assert_eq!(st["sessions"], json!({}));
+    assert_eq!(stdout(&roc(&e, &["-ps"], &[])), "no roc sessions are running\n");
+}
+
+#[test]
+fn mcp_commands_manage_servers_without_editing_json() {
+    let e = env();
+    roc(&e, &["-init", "-yes"], &[]);
+    let o = roc(&e, &["-mcp", "catalog"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    for name in ["context7", "shadcn", "figma", "wails", "wails-app", "gopls", "github"] {
+        assert!(stdout(&o).contains(name), "{name} in catalog");
+    }
+    let o = roc(
+        &e,
+        &["-mcp", "add", "shadcn,github", "api=https://mcp.example.test/mcp"],
+        &[],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stdout(&o).contains("GITHUB_PERSONAL_ACCESS_TOKEN"),
+        "missing secret is explained: {}",
+        stdout(&o)
+    );
+    let o = roc(
+        &e,
+        &[
+            "-mcp",
+            "set",
+            "api",
+            "header.Authorization=Bearer ${API_TOKEN}",
+            "requires=API_TOKEN",
+        ],
+        &[],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = roc(&e, &["-mcp", "add", "app=http://127.0.0.1:9099/mcp"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&e.state).unwrap()).unwrap();
+    let servers = &v["config"]["mcp"]["servers"];
+    assert_eq!(servers["shadcn"]["type"], "container");
+    assert_eq!(servers["shadcn"]["enabled"], true);
+    assert_eq!(servers["api"]["headers"]["Authorization"], "Bearer ${API_TOKEN}");
+    assert_eq!(servers["app"]["type"], "proxy");
+    let o = roc(&e, &["-mcp", "list"], &[]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("github") && out.contains("skipped: export GITHUB_PERSONAL_ACCESS_TOKEN"),
+        "{out}"
+    );
+    assert!(
+        out.contains("gateway → https://mcp.example.test/mcp"),
+        "secret headers are proxied: {out}"
+    );
+    let o = roc(&e, &["-mcp", "disable", "shadcn"], &[]);
+    assert!(o.status.success());
+    let o = roc(&e, &["-mcp", "rm", "api,app"], &[]);
+    assert!(o.status.success());
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&e.state).unwrap()).unwrap();
+    assert_eq!(v["config"]["mcp"]["servers"]["shadcn"]["enabled"], false);
+    assert!(v["config"]["mcp"]["servers"].get("api").is_none());
+    let o = roc(&e, &["-mcp", "add", "nope"], &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("not in the catalog"));
+    let o = roc(&e, &["-mcp", "info", "wails"], &[]);
+    assert!(stdout(&o).contains("v3.wails.io"), "{}", stdout(&o));
+}
+
+#[test]
+fn stacks_and_dry_run_wire_servers_for_the_agent() {
+    let e = env();
+    roc(&e, &["-init", "-yes"], &[]);
+    let o = roc(&e, &["-stack", "frontend"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("stack frontend"));
+    let empty_path = e.home.join("empty-bin");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let o = roc(
+        &e,
+        &[
+            "-dry-run",
+            "-assume-available",
+            "-publish",
+            "5173",
+            "-with-mcp",
+            "memory",
+            "-without-mcp",
+            "browsermcp",
+        ],
+        &[("FIGMA_API_KEY", "figd_SECRET"), ("PATH", empty_path.to_str().unwrap())],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    // The secret is forwarded by name, never written.
+    assert!(!out.contains("figd_SECRET"), "{out}");
+    assert!(out.contains("--env=FIGMA_API_KEY "), "{out}");
+    assert!(out.contains("\"FIGMA_API_KEY\": \"{env:FIGMA_API_KEY}\""), "{out}");
+    // Container servers are spawned by the agent; remote secret headers go via the gateway.
+    assert!(out.contains("\"shadcn@latest\""), "{out}");
+    assert!(out.contains("/mcp/context7"), "{out}");
+    assert!(out.contains("\"memory\""), "{out}");
+    assert!(!out.contains("\"browsermcp\""), "{out}");
+    // npx is not on this (empty) PATH, so the host server is skipped with a note.
+    assert!(
+        out.contains("# note: MCP server chrome-devtools: `npx` not found on PATH"),
+        "{out}"
+    );
+    // The agent is told what it has.
+    assert!(out.contains("## MCP servers in this session"), "{out}");
+    assert!(out.contains("container 5173 → http://localhost:5173"), "{out}");
+    let o = roc(&e, &["-dry-run", "-assume-available", "-with-mcp", "nope"], &[]);
+    assert_eq!(o.status.code(), Some(1));
 }

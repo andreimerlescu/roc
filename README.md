@@ -20,9 +20,11 @@ That command does five things:
    "Q #1 Agent" through "Q #4 Agent". Four workers means up to four roc sessions, each in its
    own container.
 3. It starts an **MCP gateway** on the host. Through it the agent can use Docker
-   (limited to containers and images it creates itself), your real browser through Browser MCP,
-   and the Xcode/iOS simulator tooling. The agent never gets the Docker socket and never gets
-   shell access to your Mac.
+   (limited to containers and images it creates itself), your real browser, live library docs,
+   Figma, a running Wails app, Xcode and the iOS simulators: whatever you switched on with
+   `roc -stack frontend` or `roc -mcp add …`. The agent never gets the Docker socket, never gets
+   shell access to your Mac, and never sees the tokens those servers use. It is also told which
+   tools it has and how to use them.
 4. It **drops you straight into the agent's TUI**. The agent never asks for approval:
    the container is the sandbox, and the agent is told to keep going until your
    `AGENTS.md` is satisfied.
@@ -40,6 +42,7 @@ That command does five things:
 - [Model providers](#model-providers)
 - [The worker pool and `roc -list`](#the-worker-pool-and-roc--list)
 - [Running several sessions at once](#running-several-sessions-at-once)
+- [Seeing and stopping sessions: `-ps` and `-kill`](#seeing-and-stopping-sessions--ps-and--kill)
 - [Mounts](#mounts)
 - [Agents](#agents)
 - [Agent settings and the never-ask default](#agent-settings-and-the-never-ask-default)
@@ -91,15 +94,23 @@ How large is each instance's context window? (tokens) [256256]
 What directories do you want to read from? (csv list, read-only) ~/work,~/statuses
 What directories do you want to write to? (csv list; empty = the directory you run roc from) ~/friends_of/planning,~/friends_of/knowledge
 Which coding agent should roc start? (opencode, goose, claudecode, codex) [opencode]
+
+MCP stacks give agents tools for a kind of work:
+  frontend  React/Tailwind web apps: live docs, shadcn/ui, Figma, real-browser and DevTools testing
+  …
+Which MCP stacks should agents get? (csv: frontend, nextjs, wails, ios, data, research, github; empty = none) frontend
 ```
 
 Answer `5` instances and you get five workers (`…:5`, "Q #5 Agent"). Run `roc -init` again
 at any time to change answers; the current values are the defaults. Flags answer their
-question up front (`roc -init -ai-model qwen3.8-27b -qty 4`), and `-init -yes` (or a
+question up front (`roc -init -ai-model qwen3.8-27b -qty 4 -stack frontend`), and `-init -yes` (or a
 non-interactive stdin) accepts every default without asking.
 
 ```sh
-# 3. Check the pool and work
+# 3. Check everything once: Docker, the image, the models, every MCP server and its secrets
+roc -doctor
+
+# 4. Check the pool and work
 roc -list
 # Q #1: available
 # Q #2: available
@@ -140,6 +151,8 @@ after `--` is passed to the agent unchanged, for example `roc -- run "fix the fa
 | `-image IMAGE` | Agent image (default `roc-agent:latest`, env `ROC_IMAGE`). |
 | `-keep-images` | Keep the images the agent built or pulled. |
 | `-no-mcp` | Skip the MCP gateway. |
+| `-with-mcp CSV` | Also use these MCP servers this session, configured or straight from the [catalog](#the-catalog). |
+| `-without-mcp CSV` | Leave these configured MCP servers out this session. |
 | `-assume-available` | Skip the model server probe and treat every free worker as available. |
 | `-save` | Store this run's `-binary`, `-image`, `-read-dir`, `-write-dir` and `-publish` as defaults. |
 | `-dry-run` | Print the worker, mounts, `docker run` command and generated agent config, then exit. |
@@ -164,6 +177,11 @@ current directory read-write.
 |---|---|
 | `-init` | Guided setup (see [Quick start](#quick-start)). `-init -yes` skips the questions; `-init -force` starts from defaults and keeps a backup. |
 | `-list` | One line per worker: `Q #N: running\|available\|offline`. Add `-json` for details. |
+| `-ps` | Running sessions by position: worker, agent, session id, uptime, working directory (`-json` too). |
+| `-kill TARGET` | Stop sessions: a `-list` position (`2`), a label (`Q#2`), a session id, or `all`. `-force` skips the graceful stop. |
+| `-doctor` | Check Docker, the image, the model server, sessions and every enabled MCP server; prints a fix for each problem (`-json` too). |
+| `-mcp [ACTION]` | Manage MCP servers: `list`, `catalog`, `stacks`, `add`, `set`, `enable`, `disable`, `rm`, `info`, `test`. See [MCP servers](#mcp-servers). |
+| `-stack CSV` | Enable MCP stacks: `frontend`, `nextjs`, `wails`, `ios`, `data`, `research`, `github`. |
 | `-agent-config` | Show this config's settings file for `-binary` and where it applies (creates missing files). |
 | `-cleanup` | Remove everything left by dead sessions, plus orphaned containers and networks of this config. |
 | `-show-state` | Print the state file. |
@@ -236,6 +254,32 @@ independent sessions:
 
 Two configs (`-state ~/a/state.json`, `-state ~/b/state.json`) can run side by side too.
 Each config only cleans up its own resources.
+
+## Seeing and stopping sessions: `-ps` and `-kill`
+
+A session's **position** is its number in `roc -list`: the session on `Q #2` is position 2.
+
+```
+$ roc -ps
+POS  WORKER  AGENT     SESSION       UP     STATE    WORKDIR
+1    Q #1    opencode  3f9a1c2b7d4e  42m    running  /Users/andrei/friends_of/planning
+2    Q #2    codex     9b0e44d1a7c3  3h05m  running  /Users/andrei/work/api
+
+$ roc -kill 2
+stopping Q #2 (codex, session 9b0e44d1a7c3) …
+stopped Q #2 (codex, session 9b0e44d1a7c3); Q #2 is free
+```
+
+`-kill` takes a position (`2`), a label (`Q#2` or `"Q #2"`), a session id or a prefix of it,
+`all`, or a comma-separated mix (`-kill 1,3`). It stops the session's agent container; the
+`roc` that owns the session sees its agent exit and removes everything it created, exactly as
+on a normal exit, and the worker is free again. If the owner is already gone or doesn't finish
+within 30 seconds, `-kill` removes the session's containers, networks, images and lease itself;
+`-force` does that straight away. roc never signals a process ID, because process IDs are reused.
+
+With provider `none` there is no pool, so sessions are numbered in the order they started
+(`agent #1`, `agent #2`, …). Sessions started on another machine show `on <host>` and can only be
+stopped there.
 
 ## Mounts
 
@@ -320,44 +364,131 @@ and deletes it when the session ends.
 
 ## MCP servers
 
-The agent reaches MCP servers in one of four ways (`type` in the state file):
+Adding a tool for the agent is one command. roc ships a catalog of vetted MCP servers, groups
+them into stacks, writes them into the state file, and at session start wires each one into
+whichever agent you run, with the right transport and with secrets kept on your machine:
 
-| type | Runs where | Reached how |
+```sh
+roc -stack frontend              # context7, shadcn, figma, browsermcp, chrome-devtools
+roc -mcp add github              # one server from the catalog
+roc -mcp                         # what is configured and whether each one will start
+roc -mcp test                    # start them now and list their tools
+roc -with-mcp memory             # just for this session
+```
+
+### Stacks
+
+| stack | servers | for |
 |---|---|---|
-| `builtin` | inside roc | `http://host.docker.internal:<port>/mcp/<name>` |
-| `host` | stdio process on **your Mac**, started by roc on first use | same gateway; roc bridges HTTP ⇄ stdio |
-| `container` | stdio process inside the agent container | agent spawns it directly |
-| `remote` | a remote streamable-HTTP server | agent connects directly |
+| `frontend` | context7, shadcn, figma, browsermcp, chrome-devtools | React/Tailwind web apps |
+| `nextjs` | the frontend stack + nextjs | Next.js apps |
+| `wails` | wails, wails-app, gopls, context7, shadcn, chrome-devtools | Wails v3 desktop apps (Go + React/Tailwind) |
+| `ios` | xcodebuildmcp, xcode, context7 | iOS and macOS apps |
+| `data` | database, memory | a SQL database and persistent memory |
+| `research` | context7, brave-search, sequential-thinking, memory | docs, web search, planning |
+| `github` | github | issues, pull requests, Actions |
+
+### The catalog
+
+`roc -mcp catalog` prints this list with what each server needs. `roc -mcp info NAME` shows the
+full definition, its secrets (set or not) and its documentation.
+
+| name | type | what for | needs |
+|---|---|---|---|
+| `docker` | builtin | Containers, images and networks **scoped to this session** ([below](#the-docker-mcp-server)). On by default. | – |
+| `browsermcp` | host | Your real Chrome tab, with your logins ([Browser MCP](https://browsermcp.io) extension). On by default. | Node.js on the host |
+| `chrome-devtools` | host | Chrome DevTools: performance traces, network, console with source maps, screenshots. | Node.js, Chrome |
+| `playwright` | container | Headless Chromium inside the agent's container. | image built with `-with-playwright` |
+| `playwright-host` | host | A visible Playwright browser on your machine, so you can watch. | Node.js |
+| `context7` | remote | Current library docs (React, Next.js, Tailwind, Wails, …) instead of stale training data. | `CONTEXT7_API_KEY` optional |
+| `shadcn` | container | The official shadcn/ui server: search registries, exact props, install commands. | – |
+| `figma` | container | Framelink: Figma layout, styles and assets as data. | `FIGMA_API_KEY` |
+| `figma-desktop` | proxy | Figma's own desktop server (Dev Mode → *Enable desktop MCP server*). | Figma desktop |
+| `nextjs` | container | Next.js DevTools: docs, upgrades, live errors and routes from `next dev`. | – |
+| `wails` | host | Wails v3 project server (`wails3 mcp`): inspect, doctor, build, dev mode, bindings, Taskfile tasks. | `wails3` on the host |
+| `wails-app` | proxy | The running Wails app: windows, DOM, JS, mouse/keyboard, bound Go methods, events. | app started with `WAILS_MCP=1` |
+| `gopls` | container | Go language server as MCP (gopls ≥ 0.20). | the agent image (included) |
+| `xcodebuildmcp` | host | Build, test and run Xcode projects; iOS simulators, UI automation. On by default on macOS. | Xcode, Node.js |
+| `xcode` | host | Xcode 26.3+'s built-in MCP via `xcrun mcpbridge`. | Xcode |
+| `database` | container | DBHub: schemas and SQL for Postgres, MySQL, SQLite, SQL Server. | `DATABASE_URL` |
+| `memory` | container | A knowledge graph that persists across this agent's sessions. | – |
+| `sequential-thinking` | container | Structured step-by-step planning with revisions. | – |
+| `brave-search` | container | Web search. | `BRAVE_API_KEY` |
+| `github` | remote | GitHub issues, pull requests, code search, Actions. | `GITHUB_PERSONAL_ACCESS_TOKEN` |
+
+A server whose required secret is unset, whose host command is missing, or that doesn't apply
+to your OS is skipped for the session with a one-line note. `roc -mcp` and `roc -doctor` show
+those reasons ahead of time, each with the command or variable that fixes it.
+
+### How servers reach the agent
+
+| type | runs where | reached how |
+|---|---|---|
+| `builtin` | inside roc | the gateway, `http://host.docker.internal:<port>/mcp/<name>` |
+| `host` | a stdio process on **your machine**, started by roc on first use | the gateway; roc bridges HTTP ⇄ stdio |
+| `proxy` | an HTTP server on your machine's loopback (a Wails app, Figma desktop) | the gateway forwards to it |
+| `remote` | a hosted streamable-HTTP server | directly; **through the gateway when a header uses a secret** |
+| `container` | a stdio process inside the agent container | the agent spawns it |
 
 The gateway listens on a random port. Every request must carry a per-session bearer token,
 and requests with an `Origin` header (that is, from browsers) are rejected. It binds to
 `127.0.0.1` on macOS and to the docker0 bridge address on Linux. It exists only while the
 session runs.
 
-### Default servers
+Picking a type: use `host` when the server must touch your machine (your browser, Xcode, a native
+Wails build), `container` when it works on project files or talks to services on the session
+network (a database you started with `docker_run`), `proxy` for HTTP servers that listen on your
+machine's 127.0.0.1, and `remote` for hosted servers.
 
-| name | type | default | What for |
-|---|---|---|---|
-| `docker` | builtin | on | Create, run, build, exec, inspect and remove containers, images and networks, **scoped to this session** (see below). |
-| `browsermcp` | host | on | Drives your real Chrome through the [Browser MCP](https://browsermcp.io) extension, for building and checking frontends. |
-| `xcodebuildmcp` | host (macOS) | on | [XcodeBuildMCP](https://github.com/getsentry/XcodeBuildMCP): builds, runs and tests Xcode projects; boots and controls iOS simulators; takes screenshots and drives the UI. |
-| `xcode` | host (macOS) | off | Xcode 26.3+'s built-in MCP via `xcrun mcpbridge` (enable *Settings → Intelligence → MCP* in Xcode). |
-| `playwright` | container | off | Headless Chromium inside the container. Needs an image built with `-with-playwright`. Useful when you don't want the agent driving your own browser. |
-| `context7` | remote | off | Up-to-date library documentation. Needs internet access. |
+### Secrets stay on your machine
 
-Turn servers on or off with `"enabled"` in the state file. You can add your own:
+Write `${VAR}` wherever a server needs a secret; roc never stores the value.
 
-```json
-"mcp": { "servers": {
-  "github": { "type": "remote", "url": "https://api.githubcopilot.com/mcp/",
-              "headers": { "Authorization": "Bearer ${GITHUB_PAT}" } },
-  "sqlite": { "type": "container", "command": "uvx", "args": ["mcp-server-sqlite", "--db-path", "/Users/andrei/work/app/dev.db"] },
-  "figma":  { "type": "host", "command": "npx", "args": ["-y", "figma-developer-mcp", "--stdio"], "env": { "FIGMA_API_KEY": "${FIGMA_API_KEY}" } }
-}}
+- **Remote headers** (`"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"`) make the server
+  go through the gateway, which adds the header on your machine. The token never enters the
+  container or a generated config file. A header whose variable is unset is left out, so optional
+  keys (Context7) just work without one.
+- **Container env** written as exactly `${NAME}` is forwarded by name: Docker reads the value from
+  roc's environment, and each agent's config refers to it (`{env:NAME}` for opencode, `${NAME}`
+  for Claude Code, `env_vars` for Codex, `env_keys` for goose).
+- **Host env and args** are expanded when roc starts the server. `${ROC_WORKDIR}` (the session's
+  working directory) and `${ROC_SESSION_ID}` are available too.
+- `requires_env` lists the variables a server can't work without; it is skipped (with a note)
+  when one is unset.
+
+### Adding your own
+
+```sh
+roc -mcp add api=https://mcp.example.com/mcp                  # remote
+roc -mcp add app=http://127.0.0.1:4000/mcp                    # loopback URLs become proxy servers
+roc -mcp add "sqlite=uvx mcp-server-sqlite --db-path /Users/andrei/work/app/dev.db"   # container (default)
+roc -mcp add "figma2=host:npx -y figma-developer-mcp --stdio"  # on your machine
+roc -mcp set api 'header.Authorization=Bearer ${API_TOKEN}' requires=API_TOKEN \
+                 hint='Use it for the billing API; never call DELETE endpoints.'
+roc -mcp disable api ; roc -mcp enable api ; roc -mcp rm api
 ```
 
-`${VAR}` in `headers` and in `env` values of host servers is expanded from your shell
-environment when roc starts. The result is never written back to the state file.
+`set` keys: `type`, `command`, `args`, `url`, `description`, `hint` (added to the agent's
+instructions), `enabled`, `requires`, `platforms`, `env.NAME`, `header.NAME` (an empty value
+removes it). Quote values containing `${…}` in single quotes so your shell leaves them alone.
+The state file can still be edited by hand; `roc -mcp info NAME` prints an entry as JSON.
+
+### The agent knows what it has
+
+Every session's instructions end with a generated section listing the servers that actually
+started, what each is for and how to use it (for example: "browser tools on the host reach your
+dev server only through published ports"). It also lists the ports published with `-publish`,
+or says that none are, so the agent doesn't chase a dev server your browser can't reach.
+
+### Protocol versions
+
+The gateway speaks MCP 2024-11-05 through 2025-11-25 and the stateless
+[2026-07-28](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/) revision:
+clients may skip `initialize`, ask `server/discover`, and send `Mcp-Method` routing headers (a
+header that disagrees with the body is rejected). roc initialises older stdio and HTTP servers on
+such a client's behalf, keeps their `Mcp-Session-Id`, and renews an expired session once.
+Remote servers honour `HTTPS_PROXY`/`NO_PROXY` (never for local or private hosts), and TLS uses
+your system's trust store.
 
 ### The Docker MCP server
 
@@ -384,13 +515,34 @@ Policy (configurable under `config.docker`):
   the agent can `curl http://roc-<session id>-api:8080` by container name.
 - When the session ends, everything goes: containers, networks, and images (unless `-keep-images`).
 
-### Typical frontend loop
+### Workflows
 
-1. The agent runs `npm run dev -- --host 0.0.0.0` inside its own container. Start roc with
-   `-publish 5173` so the dev server is reachable at `http://localhost:5173` on your Mac.
-2. It opens and checks the page through `browsermcp` in your real browser.
-3. It starts a database with `docker_run {"image":"postgres:17","name":"db","env":{…}}` and
+**A React/Tailwind frontend** (`roc -stack frontend`, then `roc -publish 5173`):
+
+1. The agent checks APIs it isn't sure of with `context7` and gets exact component props from `shadcn`.
+2. Given a Figma frame link, it reads the design with `figma` and downloads the assets.
+3. It runs `npm run dev -- --host 0.0.0.0` in its container; the dev server is at
+   `http://localhost:5173` on your machine.
+4. It checks the page in your real browser with `browsermcp`, and console errors, failed requests
+   and performance with `chrome-devtools`.
+5. It starts a database with `docker_run {"image":"postgres:17","name":"db","env":{…}}` and
    connects to `roc-<session id>-db:5432`.
+
+**A Wails v3 desktop app** (`roc -stack wails`; needs `wails3` on your machine):
+
+1. The agent edits Go services and the React/Tailwind frontend in the container, using `gopls` for
+   Go references and diagnostics and `context7`/`shadcn` for the UI.
+2. Through `wails` (the `wails3 mcp` server, running on your machine and scoped to the working
+   directory) it regenerates TypeScript bindings, runs `wails3 doctor`, and builds or starts
+   dev mode natively, so you get a real `.app`/`.exe`, not a Linux binary.
+3. While you run `WAILS_MCP=1 wails3 dev` on your machine, `wails-app` lets it inspect the DOM,
+   evaluate JavaScript, click and type, and call bound Go methods in the real window. (Keep
+   `WAILS_MCP` out of your shell profile; builds inherit it and production builds must not include
+   the in-app server.)
+4. `go test` and `npm test` run in the container as usual.
+
+**An iOS app** (`roc -stack ios`): XcodeBuildMCP builds and tests on your Mac, boots simulators
+and drives the UI; project paths are identical on both sides, so the agent passes them as it sees them.
 
 ## The state file
 
@@ -463,6 +615,8 @@ Why this file is safe to rely on:
   cloud credentials. Host environment variables pass through only when you ask with `-env` or `env_passthrough`.
 - **Host MCP servers run as you on your Mac.** That is their purpose: driving your browser and
   simulators. Enable only servers you trust. Their stderr goes to log files, never to your terminal.
+- **MCP secrets stay on the host.** Tokens in remote server headers are added by the gateway;
+  container servers get secrets forwarded by name, never written to a config file.
 - **The gateway** listens on loopback (macOS) and requires a 192-bit random token that changes every session.
   Requests with an `Origin` header are refused, so a web page cannot use DNS rebinding to reach it.
 - **The network is not isolated.** The agent can reach your model server, your LAN and the internet
@@ -498,7 +652,10 @@ Why this file is safe to rely on:
 | Claude Code refuses `--dangerously-skip-permissions` | It won't run as root. Don't run roc as root. |
 | Codex can't talk to the model | Set `config.agent.codex_wire_api` to `chat` (older LM Studio and Ollama builds have no `/v1/responses`). |
 | The agent still asks for approval | Check `agents/<agent>` for a stricter setting; `roc -dry-run` shows the merged config. |
-| Anything else | `roc -dry-run …` shows exactly what would run, and the session log has the rest. |
+| `MCP server X skipped: …` at start | Run `roc -doctor`: it names the missing secret or host tool and how to get it. |
+| An MCP server misbehaves | `roc -mcp test NAME` starts it outside a session and lists its tools; host servers log to `~/.local/roc/logs/<session>-mcp-<name>.log`. |
+| A session is stuck or you need its worker | `roc -ps`, then `roc -kill N` (add `-force` if it doesn't stop). |
+| Anything else | `roc -doctor`, then `roc -dry-run …`: it shows exactly what would run, including the MCP wiring and the agent's instructions. |
 
 ## Migrating from a host opencode install
 
@@ -545,7 +702,9 @@ checks they get four workers and four containers, and checks that a fifth is ref
 Source map: `cli.rs` (flags), `init.rs` (guided setup), `session.rs` (lifecycle), `state.rs`
 (state file), `pool.rs` (leases), `provider.rs` (LM Studio / Ollama / OpenAI probes), `paths.rs`
 (mount validation), `agents.rs` (per-agent config), `agent_files.rs` (`agents/` settings),
-`docker.rs` (docker CLI and cleanup), `mcp/` (gateway, stdio bridge, Docker tools).
+`docker.rs` (docker CLI and cleanup), `control.rs` (`-ps`, `-kill`), `doctor.rs` (`-doctor`),
+`mcpctl.rs` (`-mcp`, `-stack`), `mcp/` (gateway, stdio bridge, HTTP proxy, Docker tools,
+`catalog.rs` for the built-in servers and stacks, `plan.rs` for how each server reaches the agent).
 
 Please report security issues privately via GitHub security advisories on
 `playandprosper/roc`.

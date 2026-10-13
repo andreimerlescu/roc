@@ -16,17 +16,17 @@ use crate::cli::{self, Args};
 use crate::commands;
 use crate::docker::{self, AgentRun, DockerCli, LABEL_CONFIG, LABEL_MANAGED, LABEL_ROLE, LABEL_SESSION, RealDocker};
 use crate::error::{Error, Result};
-use crate::mcp::bridge::{BridgeConfig, StdioBridge};
+use crate::mcp::bridge::StdioBridge;
 use crate::mcp::docker_tools::{DockerTools, SessionCtx};
 use crate::mcp::gateway::Gateway;
-use crate::mcp::{McpHandler, ToolServer};
+use crate::mcp::plan::{McpPlan, PlanCtx, Target};
+use crate::mcp::proxy::HttpProxy;
+use crate::mcp::{self, McpHandler, ToolServer};
 use crate::paths::{self, Mount, MountPolicy};
 use crate::pool::{self, SelectError, WorkerView};
 use crate::provider::{self, Probe};
 use crate::rlog;
-use crate::state::{
-    McpKind, NetworkRecord, ProviderKind, Resources, Session, SessionStatus, State, StateError, StateStore,
-};
+use crate::state::{NetworkRecord, ProviderKind, Resources, Session, SessionStatus, State, StateError, StateStore};
 use crate::util;
 
 /// Number of session logs kept in `~/.local/roc/logs`.
@@ -255,58 +255,42 @@ fn merge_toml_file(path: &Path, table: &toml::Table) -> std::io::Result<()> {
     Ok(())
 }
 
-fn expand_env_refs(s: &str) -> String {
-    // ${NAME} → host env value (used for remote MCP headers).
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find("${") {
-        out.push_str(&rest[..i]);
-        match rest[i + 2..].find('}') {
-            Some(j) => {
-                let name = &rest[i + 2..i + 2 + j];
-                out.push_str(&std::env::var(name).unwrap_or_default());
-                rest = &rest[i + 3 + j..];
-            }
-            None => {
-                out.push_str(&rest[i..]);
-                rest = "";
-            }
-        }
+/// The MCP wiring for a session: configured servers, adjusted by
+/// `-with-mcp` / `-without-mcp`, planned for this host.
+fn mcp_plan(st: &State, args: &Args, session_id: &str, plan: &Plan, store: &StateStore, log: bool) -> Result<McpPlan> {
+    if args.no_mcp {
+        return Ok(McpPlan::default());
     }
-    out.push_str(rest);
-    out
+    let servers = mcp::plan::effective_servers(
+        &st.config.mcp.servers,
+        &cli::flatten_csv(&args.with_mcp),
+        &cli::flatten_csv(&args.without_mcp),
+    )?;
+    let ctx = PlanCtx {
+        session_id: session_id.to_string(),
+        workdir: plan.workdir.clone(),
+        roots: plan.mounts.iter().map(|m| m.path.clone()).collect(),
+        log_dir: log.then(|| store.log_dir()),
+        timeout: Duration::from_secs(st.config.mcp.request_timeout_secs.max(5)),
+        published: plan.publish.clone(),
+    };
+    Ok(mcp::plan::plan(&servers, &ctx))
 }
 
-/// MCP wiring for a session.
-struct McpSetup {
-    handlers: BTreeMap<String, Arc<dyn McpHandler>>,
-    direct: Vec<McpEndpoint>,
-    warnings: Vec<String>,
-}
-
-fn mcp_setup(
+/// Builds the gateway handlers for the planned servers.
+fn gateway_handlers(
+    mcp: &McpPlan,
     st: &State,
     sess: &Session,
     plan: &Plan,
     store: &StateStore,
     docker: Arc<dyn DockerCli>,
     worker: &WorkerView,
-) -> McpSetup {
+) -> BTreeMap<String, Arc<dyn McpHandler>> {
     let mut handlers: BTreeMap<String, Arc<dyn McpHandler>> = BTreeMap::new();
-    let mut direct = Vec::new();
-    let mut warnings = Vec::new();
-    let timeout = Duration::from_secs(st.config.mcp.request_timeout_secs.max(5));
-    let host_cwd = Some(plan.workdir.clone()).filter(|p| p.is_dir());
-    for (name, srv) in &st.config.mcp.servers {
-        if !srv.enabled || !srv.supports_this_platform() {
-            continue;
-        }
-        match srv.kind {
-            McpKind::Builtin => {
-                if name != "docker" {
-                    warnings.push(format!("unknown builtin MCP server {name:?} skipped"));
-                    continue;
-                }
+    for (name, target) in &mcp.gateway {
+        let h: Arc<dyn McpHandler> = match target {
+            Target::Docker => {
                 let ctx = SessionCtx {
                     config_label: store.config_label(),
                     session_id: sess.id.clone(),
@@ -321,56 +305,17 @@ fn mcp_setup(
                         "workdir": paths::container_path(&plan.workdir),
                         "published_agent_ports": plan.publish,
                         "host_from_container": "host.docker.internal",
+                        "mcp_servers": mcp.active.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                     }),
                 };
-                handlers.insert(
-                    name.clone(),
-                    Arc::new(ToolServer(DockerTools::new(docker.clone(), Some(store.clone()), ctx))),
-                );
+                Arc::new(ToolServer(DockerTools::new(docker.clone(), Some(store.clone()), ctx)))
             }
-            McpKind::Host => {
-                let Some(program) = util::which(&srv.command) else {
-                    warnings.push(format!(
-                        "MCP server {name}: `{}` not found on PATH; skipped",
-                        srv.command
-                    ));
-                    continue;
-                };
-                let bridge = StdioBridge::new(BridgeConfig {
-                    name: name.clone(),
-                    command: program.to_string_lossy().into_owned(),
-                    args: srv.args.clone(),
-                    env: srv.env.iter().map(|(k, v)| (k.clone(), expand_env_refs(v))).collect(),
-                    cwd: host_cwd.clone(),
-                    log_path: Some(store.log_dir().join(format!("{}-mcp-{name}.log", sess.id))),
-                    timeout,
-                    roots: plan.mounts.iter().map(|m| m.path.clone()).collect(),
-                });
-                handlers.insert(name.clone(), Arc::new(bridge));
-            }
-            McpKind::Container => direct.push(McpEndpoint::Stdio {
-                name: name.clone(),
-                command: srv.command.clone(),
-                args: srv.args.clone(),
-                env: srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            }),
-            McpKind::Remote => direct.push(McpEndpoint::Http {
-                name: name.clone(),
-                url: srv.url.clone(),
-                gateway_auth: false,
-                headers: srv
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), expand_env_refs(v)))
-                    .collect(),
-            }),
-        }
+            Target::Bridge(cfg) => Arc::new(StdioBridge::new(cfg.clone())),
+            Target::Proxy(cfg) => Arc::new(HttpProxy::new(cfg.clone())),
+        };
+        handlers.insert(name.clone(), h);
     }
-    McpSetup {
-        handlers,
-        direct,
-        warnings,
-    }
+    handlers
 }
 
 /// The pseudo worker used with provider `none` (no lease, no model).
@@ -477,6 +422,7 @@ fn assemble(
     sess: &Session,
     w: &WorkerView,
     endpoints: Vec<McpEndpoint>,
+    mcp: &McpPlan,
     mcp_token: &str,
     args: &Args,
     tty: bool,
@@ -506,7 +452,7 @@ fn assemble(
         mcp_token: mcp_token.to_string(),
         mcp: endpoints,
         overlay: files.load_overlay(plan.agent)?,
-        instructions: files.instructions(),
+        instructions: files.instructions() + &mcp::plan::instructions_section(&mcp.active, &plan.publish),
         workdir: paths::container_path(&plan.workdir),
         user_args: args.agent_args.clone(),
     };
@@ -517,6 +463,11 @@ fn assemble(
     let mut secret_env = launch.token_env.clone();
     secret_env.push(agents::MCP_TOKEN_ENV.into());
     secret_env.extend(plan.passthrough.iter().cloned());
+    for k in &mcp.forward_env {
+        if !secret_env.contains(k) {
+            secret_env.push(k.clone());
+        }
+    }
     let run = AgentRun {
         config_label: store.config_label(),
         session_id: sess.id.clone(),
@@ -560,35 +511,16 @@ fn dry_run(st: &State, store: &StateStore, plan: &Plan, args: &Args) -> Result<i
     };
     let id = "dryrun000000";
     let sess = new_session(id, plan, &w);
-    let mut endpoints = Vec::new();
-    if !args.no_mcp {
-        for (name, srv) in &st.config.mcp.servers {
-            if !srv.enabled || !srv.supports_this_platform() {
-                continue;
-            }
-            match srv.kind {
-                McpKind::Builtin | McpKind::Host => endpoints.push(McpEndpoint::Http {
-                    name: name.clone(),
-                    url: format!("http://host.docker.internal:<port>/mcp/{name}"),
-                    gateway_auth: true,
-                    headers: vec![],
-                }),
-                McpKind::Container => endpoints.push(McpEndpoint::Stdio {
-                    name: name.clone(),
-                    command: srv.command.clone(),
-                    args: srv.args.clone(),
-                    env: vec![],
-                }),
-                McpKind::Remote => endpoints.push(McpEndpoint::Http {
-                    name: name.clone(),
-                    url: srv.url.clone(),
-                    gateway_auth: false,
-                    headers: vec![],
-                }),
-            }
-        }
+    let mcp = mcp_plan(st, args, id, plan, store, false)?;
+    for warning in &mcp.warnings {
+        println!("# note: {warning}");
     }
-    let (launch, run) = assemble(st, store, plan, &sess, &w, endpoints, "<mcp-token>", args, true)?;
+    let mut endpoints = mcp.direct.clone();
+    endpoints.extend(mcp::plan::gateway_endpoints(
+        mcp.gateway.iter().map(|(n, _)| n.clone()),
+        "<port>",
+    ));
+    let (launch, run) = assemble(st, store, plan, &sess, &w, endpoints, &mcp, "<mcp-token>", args, true)?;
     println!("# worker: {} ({}) [{}]", w.label, w.model, w.status);
     println!("# agent:  {}", plan.agent);
     for m in &plan.mounts {
@@ -759,46 +691,38 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
 
     // 6. MCP gateway.
     let mcp_token = util::random_hex(24);
-    let mut endpoints = Vec::new();
-    if !args.no_mcp {
-        let setup = mcp_setup(&st, &sess, &plan, store, docker.clone(), &worker);
-        for w in &setup.warnings {
-            eprintln!("roc: {w}");
-            rlog!("{w}");
-        }
-        endpoints.extend(setup.direct);
-        if !setup.handlers.is_empty() {
-            let bind = if st.config.mcp.bind == "auto" {
-                docker::auto_bind_address(docker.as_ref())
-            } else {
-                st.config.mcp.bind.clone()
-            };
-            let gw = match Gateway::start(&bind, st.config.mcp.port, mcp_token.clone(), setup.handlers.clone()) {
-                Ok(g) => g,
-                Err(e) if st.config.mcp.bind == "auto" && bind != "127.0.0.1" => {
-                    rlog!("{e}; falling back to 127.0.0.1");
-                    Gateway::start("127.0.0.1", st.config.mcp.port, mcp_token.clone(), setup.handlers)?
-                }
-                Err(e) => return Err(Error(e)),
-            };
-            let port = gw.addr().port();
-            for name in gw.names() {
-                endpoints.push(McpEndpoint::Http {
-                    name: name.clone(),
-                    url: format!("http://host.docker.internal:{port}/mcp/{name}"),
-                    gateway_auth: true,
-                    headers: vec![],
-                });
+    let mcp = mcp_plan(&st, args, &id, &plan, store, true)?;
+    for w in &mcp.warnings {
+        eprintln!("roc: {w}");
+        rlog!("{w}");
+    }
+    let mut endpoints = mcp.direct.clone();
+    let handlers = gateway_handlers(&mcp, &st, &sess, &plan, store, docker.clone(), &worker);
+    if !handlers.is_empty() {
+        let bind = if st.config.mcp.bind == "auto" {
+            docker::auto_bind_address(docker.as_ref())
+        } else {
+            st.config.mcp.bind.clone()
+        };
+        let gw = match Gateway::start(&bind, st.config.mcp.port, mcp_token.clone(), handlers.clone()) {
+            Ok(g) => g,
+            Err(e) if st.config.mcp.bind == "auto" && bind != "127.0.0.1" => {
+                rlog!("{e}; falling back to 127.0.0.1");
+                Gateway::start("127.0.0.1", st.config.mcp.port, mcp_token.clone(), handlers)?
             }
-            sess.gateway = gw.addr().to_string();
-            guard.gateway = Some(gw);
-        }
+            Err(e) => return Err(Error(e)),
+        };
+        endpoints.extend(mcp::plan::gateway_endpoints(gw.names(), &gw.addr().port().to_string()));
+        sess.gateway = gw.addr().to_string();
+        guard.gateway = Some(gw);
     }
 
     // 7. Agent configuration.
     use std::io::IsTerminal;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let (launch, run) = assemble(&st, store, &plan, &sess, &worker, endpoints, &mcp_token, args, tty)?;
+    let (launch, run) = assemble(
+        &st, store, &plan, &sess, &worker, endpoints, &mcp, &mcp_token, args, tty,
+    )?;
     for (rel, body) in &launch.files {
         let p = sdir.join(rel);
         if let Some(parent) = p.parent() {
@@ -885,16 +809,6 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn env_ref_expansion() {
-        // SAFETY: test-local variable name.
-        unsafe { std::env::set_var("ROC_TEST_TOKEN_X", "abc") };
-        assert_eq!(expand_env_refs("Bearer ${ROC_TEST_TOKEN_X}"), "Bearer abc");
-        assert_eq!(expand_env_refs("${ROC_TEST_UNSET_Y}x"), "x");
-        assert_eq!(expand_env_refs("no refs"), "no refs");
-        assert_eq!(expand_env_refs("broken ${X"), "broken ${X");
-    }
 
     #[test]
     fn toml_file_merge_keeps_agent_written_keys() {

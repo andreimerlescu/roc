@@ -157,16 +157,33 @@ pub struct Outcome {
     pub body: String,
 }
 
+/// The parts of one HTTP request the router looks at.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Req<'a> {
+    /// HTTP method.
+    pub method: &'a str,
+    /// Request target (path and query).
+    pub url: &'a str,
+    /// `Authorization` header.
+    pub auth: Option<&'a str>,
+    /// `Origin` header (browsers only).
+    pub origin: Option<&'a str>,
+    /// `Mcp-Method` header (2026-07-28 clients).
+    pub mcp_method: Option<&'a str>,
+    /// Body.
+    pub body: &'a [u8],
+}
+
 /// Routes a request given its parts.
-pub fn route(
-    method: &str,
-    url: &str,
-    auth: Option<&str>,
-    origin: Option<&str>,
-    body: &[u8],
-    token: &str,
-    handlers: &BTreeMap<String, Arc<dyn McpHandler>>,
-) -> Outcome {
+pub fn route(r: Req<'_>, token: &str, handlers: &BTreeMap<String, Arc<dyn McpHandler>>) -> Outcome {
+    let Req {
+        method,
+        url,
+        auth,
+        origin,
+        mcp_method,
+        body,
+    } = r;
     let path = url.split('?').next().unwrap_or("");
     if path == "/healthz" {
         return Outcome {
@@ -225,6 +242,20 @@ pub fn route(
             };
         }
     };
+    // 2026-07-28: the routing header must agree with the body.
+    if let Some(h) = mcp_method {
+        if msg.get("method").and_then(Value::as_str).is_some_and(|m| m != h) {
+            return Outcome {
+                status: 400,
+                body: err_response(
+                    &Value::Null,
+                    code::INVALID_REQUEST,
+                    "Mcp-Method header does not match the body",
+                )
+                .to_string(),
+            };
+        }
+    }
     let responses: Vec<Value> = match msg {
         Value::Array(items) => items.into_iter().filter_map(|m| handler.handle(m)).collect(),
         Value::Object(_) => handler.handle(msg).into_iter().collect(),
@@ -264,11 +295,14 @@ fn serve(mut req: Request, ctx: &Ctx) {
     };
     let url = req.url().to_string();
     let out = route(
-        method,
-        &url,
-        req_header(&req, "Authorization"),
-        req_header(&req, "Origin"),
-        &body,
+        Req {
+            method,
+            url: &url,
+            auth: req_header(&req, "Authorization"),
+            origin: req_header(&req, "Origin"),
+            mcp_method: req_header(&req, "Mcp-Method"),
+            body: &body,
+        },
         &ctx.token,
         &ctx.handlers,
     );
@@ -306,24 +340,32 @@ mod tests {
     #[test]
     fn routing_rules() {
         let h = handlers();
+        let route = |method: &str, url: &str, auth: Option<&str>, origin: Option<&str>, body: &[u8]| {
+            route(
+                Req {
+                    method,
+                    url,
+                    auth,
+                    origin,
+                    mcp_method: None,
+                    body,
+                },
+                "s3cret",
+                &h,
+            )
+        };
         let ping = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let good = Some("Bearer s3cret");
-        assert_eq!(route("GET", "/healthz", None, None, b"", "s3cret", &h).status, 200);
-        assert_eq!(route("POST", "/other", good, None, ping, "s3cret", &h).status, 404);
-        assert_eq!(route("POST", "/mcp/t", None, None, ping, "s3cret", &h).status, 401);
-        assert_eq!(
-            route("POST", "/mcp/t", Some("Bearer nope"), None, ping, "s3cret", &h).status,
-            401
-        );
-        assert_eq!(
-            route("POST", "/mcp/t", good, Some("http://evil"), ping, "s3cret", &h).status,
-            403
-        );
-        assert_eq!(route("POST", "/mcp/x", good, None, ping, "s3cret", &h).status, 404);
-        assert_eq!(route("GET", "/mcp/t", good, None, b"", "s3cret", &h).status, 405);
-        assert_eq!(route("DELETE", "/mcp/t", good, None, b"", "s3cret", &h).status, 200);
-        assert_eq!(route("POST", "/mcp/t", good, None, b"{bad", "s3cret", &h).status, 400);
-        let ok = route("POST", "/mcp/t?x=1", good, None, ping, "s3cret", &h);
+        assert_eq!(route("GET", "/healthz", None, None, b"").status, 200);
+        assert_eq!(route("POST", "/other", good, None, ping).status, 404);
+        assert_eq!(route("POST", "/mcp/t", None, None, ping).status, 401);
+        assert_eq!(route("POST", "/mcp/t", Some("Bearer nope"), None, ping).status, 401);
+        assert_eq!(route("POST", "/mcp/t", good, Some("http://evil"), ping).status, 403);
+        assert_eq!(route("POST", "/mcp/x", good, None, ping).status, 404);
+        assert_eq!(route("GET", "/mcp/t", good, None, b"").status, 405);
+        assert_eq!(route("DELETE", "/mcp/t", good, None, b"").status, 200);
+        assert_eq!(route("POST", "/mcp/t", good, None, b"{bad").status, 400);
+        let ok = route("POST", "/mcp/t?x=1", good, None, ping);
         assert_eq!(ok.status, 200);
         assert_eq!(serde_json::from_str::<Value>(&ok.body).unwrap()["id"], 1);
         let note = route(
@@ -332,8 +374,6 @@ mod tests {
             good,
             None,
             br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            "s3cret",
-            &h,
         );
         assert_eq!(note.status, 202);
         let batch = route(
@@ -342,10 +382,34 @@ mod tests {
             good,
             None,
             br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"n"}]"#,
+        );
+        assert!(serde_json::from_str::<Value>(&batch.body).unwrap().is_array());
+        let mismatch = super::route(
+            Req {
+                method: "POST",
+                url: "/mcp/t",
+                auth: good,
+                origin: None,
+                mcp_method: Some("tools/list"),
+                body: ping,
+            },
             "s3cret",
             &h,
         );
-        assert!(serde_json::from_str::<Value>(&batch.body).unwrap().is_array());
+        assert_eq!(mismatch.status, 400);
+        let agree = super::route(
+            Req {
+                method: "POST",
+                url: "/mcp/t",
+                auth: good,
+                origin: None,
+                mcp_method: Some("ping"),
+                body: ping,
+            },
+            "s3cret",
+            &h,
+        );
+        assert_eq!(agree.status, 200);
     }
 
     fn http(addr: SocketAddr, req: &str) -> (u16, String) {

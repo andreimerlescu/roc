@@ -1,5 +1,6 @@
 //! Non-session commands: -init, -show-state, -list, -cleanup, -build-image,
-//! -agent-config.
+//! -agent-config, and dispatch to -ps/-kill (control), -mcp/-stack (mcpctl)
+//! and -doctor.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -38,7 +39,22 @@ pub fn dispatch(args: Args) -> Result<i32> {
     if args.list {
         return list(&store, &args);
     }
+    if args.ps {
+        return crate::control::ps(&store, &args);
+    }
+    if let Some(action) = &args.mcp {
+        return crate::mcpctl::run(&store, &args, action);
+    }
+    if !args.stack.is_empty() {
+        return crate::mcpctl::stacks(&store, &cli::flatten_csv(&args.stack));
+    }
     let docker = RealDocker::default();
+    if !args.kill.is_empty() {
+        return crate::control::kill(&store, &docker, &args);
+    }
+    if args.doctor {
+        return crate::doctor::run(&store, &args, &docker);
+    }
     if args.cleanup {
         return cleanup(&store, &docker, true);
     }

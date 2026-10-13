@@ -69,11 +69,8 @@ pub fn validate_host(base: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(timeout)
-        .timeout(timeout)
-        .build()
+fn agent(base: &str, timeout: Duration) -> ureq::Agent {
+    crate::util::http_agent(base, timeout, timeout)
 }
 
 fn get_json(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
@@ -153,7 +150,7 @@ fn probe_openai(a: &ureq::Agent, base: &str, token: Option<&str>, prior: Option<
 /// * OpenAI-compatible: `/models`.
 /// * none: skipped.
 pub fn probe(kind: ProviderKind, base: &str, token: Option<&str>, timeout: Duration) -> Probe {
-    let a = agent(timeout);
+    let a = agent(base, timeout);
     match kind {
         ProviderKind::None => Probe::Skipped,
         ProviderKind::Openai => probe_openai(&a, base, token, None),

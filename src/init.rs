@@ -10,6 +10,7 @@ use crate::agent_files::AgentFiles;
 use crate::agents::Agent;
 use crate::cli::{self, Args};
 use crate::error::{Error, Result};
+use crate::mcp::{catalog, plan};
 use crate::paths::{self, MountPolicy};
 use crate::provider::{self, Load, Probe};
 use crate::state::{MAX_WORKERS, ProviderKind, State, StateStore};
@@ -89,6 +90,8 @@ pub struct Answers {
     pub write: Vec<String>,
     /// Agent.
     pub binary: Agent,
+    /// MCP stacks to enable (`frontend`, `wails`, …).
+    pub stacks: Vec<String>,
 }
 
 /// Joins names as "a, b and c".
@@ -285,6 +288,23 @@ pub fn ask<R: BufRead, W: Write>(
             |a| a.parse::<Agent>(),
         )?,
     };
+    let stacks = if args.stack.is_empty() {
+        let names: Vec<&str> = catalog::STACKS.iter().map(|s| s.name).collect();
+        p.say("\nMCP stacks give agents tools for a kind of work:");
+        for s in catalog::STACKS {
+            p.say(&format!("  {:<9} {}", s.name, s.summary));
+        }
+        p.ask_valid(
+            &format!(
+                "Which MCP stacks should agents get? (csv: {}; empty = none)",
+                names.join(", ")
+            ),
+            "",
+            check_stacks,
+        )?
+    } else {
+        check_stacks(&args.stack.join(","))?
+    };
     Ok(Answers {
         provider,
         host,
@@ -294,7 +314,22 @@ pub fn ask<R: BufRead, W: Write>(
         read,
         write,
         binary,
+        stacks,
     })
+}
+
+/// Validates a CSV list of stack names.
+fn check_stacks(a: &str) -> std::result::Result<Vec<String>, String> {
+    let list = paths::split_csv(a);
+    for n in &list {
+        if catalog::stack(n).is_none() {
+            return Err(format!(
+                "unknown stack {n:?}; choose from {}",
+                catalog::STACKS.iter().map(|s| s.name).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(list.into_iter().map(|n| n.to_ascii_lowercase()).collect())
 }
 
 /// Applies answers to a state.
@@ -315,6 +350,11 @@ pub fn apply(st: &mut State, a: &Answers) {
     st.config.mounts.read = a.read.clone();
     st.config.mounts.write = a.write.clone();
     st.config.agent.binary = a.binary.name().into();
+    for n in &a.stacks {
+        if let Some(stack) = catalog::stack(n) {
+            plan::apply_stack(&mut st.config.mcp.servers, stack);
+        }
+    }
 }
 
 /// Entry point for `roc -init`.
@@ -350,6 +390,11 @@ pub fn run(store: &StateStore, args: &Args, interactive: bool) -> Result<i32> {
                 if let Some(b) = &args.binary {
                     st.config.agent.binary = b.parse::<Agent>()?.name().into();
                 }
+                for n in check_stacks(&cli::flatten_csv(&args.stack).join(","))? {
+                    if let Some(stack) = catalog::stack(&n) {
+                        plan::apply_stack(&mut st.config.mcp.servers, stack);
+                    }
+                }
             }
         }
         Ok::<_, Error>(st.clone())
@@ -375,8 +420,20 @@ pub fn run(store: &StateStore, args: &Args, interactive: bool) -> Result<i32> {
             println!("If your server needs an API token: export {env}=… (roc never saves it).");
         }
     }
+    let on: Vec<&String> = st
+        .config
+        .mcp
+        .servers
+        .iter()
+        .filter(|(_, s)| s.enabled)
+        .map(|(n, _)| n)
+        .collect();
     println!(
-        "Next: `roc -list` to see the instances, then `roc` to start {}.",
+        "MCP servers on: {} (`roc -mcp` lists them, `roc -mcp catalog` has more).",
+        on.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+    );
+    println!(
+        "Next: `roc -doctor` to check everything, `roc -list` to see the instances, then `roc` to start {}.",
         st.config.agent.binary
     );
     Ok(0)
@@ -428,8 +485,7 @@ mod tests {
     #[test]
     fn conversation_matches_the_spec() {
         let fx = fx();
-        let input =
-            "lmstudio\n\nqwen3.8-27b\n4\n\n~/work,~/statuses\n~/friends_of/planning,~/friends_of/knowledge\nopencode\n";
+        let input = "lmstudio\n\nqwen3.8-27b\n4\n\n~/work,~/statuses\n~/friends_of/planning,~/friends_of/knowledge\nopencode\nmobile\nfrontend,wails\n";
         let (r, out) = run_wizard(&fx, input, &Args::default(), &unreachable);
         let a = r.unwrap();
         assert!(out.contains("Which model are you using?"), "{out}");
@@ -443,10 +499,16 @@ mod tests {
         assert_eq!(a.read, vec!["~/work", "~/statuses"]);
         assert_eq!(a.write, vec!["~/friends_of/planning", "~/friends_of/knowledge"]);
         assert_eq!(a.binary, Agent::OpenCode);
+        assert!(out.contains("Which MCP stacks should agents get?"));
+        assert!(out.contains("unknown stack \"mobile\""), "{out}");
+        assert_eq!(a.stacks, vec!["frontend", "wails"]);
         let mut st = State::default();
         apply(&mut st, &a);
         assert_eq!(st.config.ai.models.len(), 4);
         assert_eq!(st.config.ai.models["qwen3.8-27b:4"].name, "Q #4 Agent");
+        for n in ["context7", "shadcn", "wails", "wails-app", "gopls"] {
+            assert!(st.config.mcp.servers[n].enabled, "{n}");
+        }
     }
 
     #[test]

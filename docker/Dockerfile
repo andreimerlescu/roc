@@ -1,5 +1,6 @@
 # roc agent image: opencode, goose, Claude Code and Codex plus common
-# toolchains (Node, Go, Rust, Python, PHP). Built with `roc -build-image`
+# toolchains (Node, Go, Rust, Python, PHP) and MCP runtimes (npx, uvx,
+# gopls). Built with `roc -build-image`
 # or `make image`. The container runs as your host uid/gid; $HOME (/home/roc)
 # is a bind mount of ~/.local/roc/home/<agent> so agent state persists.
 #
@@ -10,6 +11,11 @@
 #   CLAUDE_VERSION    npm version of @anthropic-ai/claude-code (default: latest)
 #   GOOSE_VERSION     goose release tag, e.g. v1.9.0      (default: stable)
 #   WITH_PLAYWRIGHT   1 to add @playwright/mcp + headless Chromium
+#   UV_VERSION        tag of ghcr.io/astral-sh/uv            (default: latest)
+#   GOPLS_VERSION     gopls version (≥ v0.20 has `gopls mcp`) (default: latest)
+
+ARG UV_VERSION=latest
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 FROM node:22-trixie-slim
 
@@ -19,11 +25,14 @@ ARG CODEX_VERSION=latest
 ARG CLAUDE_VERSION=latest
 ARG GOOSE_VERSION=1.52.0
 ARG WITH_PLAYWRIGHT=0
+ARG GOPLS_VERSION=latest
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="roc-agent" \
       org.opencontainers.image.source="https://github.com/andreimerlescu/roc" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="Apache-2.0" \
+      roc.features="uv,gopls" \
+      roc.with_playwright="${WITH_PLAYWRIGHT}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -43,6 +52,16 @@ RUN set -eux; \
     v="${GO_VERSION:-$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1 | sed 's/^go//')}"; \
     curl -fsSL "https://go.dev/dl/go${v}.linux-${arch}.tar.gz" | tar -C /usr/local -xz; \
     /usr/local/go/bin/go version
+
+# gopls serves Go code intelligence over MCP (`gopls mcp`, catalog entry "gopls").
+RUN set -eux; \
+    GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
+        /usr/local/go/bin/go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"; \
+    rm -rf /tmp/gopath /tmp/gocache; \
+    gopls version
+
+# uv/uvx run Python MCP servers (`uvx mcp-server-…`).
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 RUN set -eux; \
     curl -fsSL https://sh.rustup.rs | CARGO_HOME=/usr/local/cargo sh -s -- -y --no-modify-path --profile minimal --component rustfmt,clippy; \

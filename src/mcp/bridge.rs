@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{McpHandler, code, err_response, is_notification, is_request};
+use super::{LEGACY_DEFAULT_VERSION, McpHandler, code, err_response, is_notification, is_request};
 
 /// Maximum automatic restarts of a crashed child.
 pub const MAX_RESTARTS: u32 = 5;
@@ -224,16 +224,27 @@ impl StdioBridge {
         }
         let p = guard.as_mut().expect("just set");
         if !p.initialized {
-            let params = self.init_params.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(params) = params {
-                let resp = self.request(&p.stdin, "initialize", Some(params), None);
-                if let Some(e) = resp.get("error") {
-                    return Err(format!("MCP server {} failed to initialise: {e}", self.cfg.name));
-                }
-                *self.init_result.lock().unwrap_or_else(|e| e.into_inner()) = resp.get("result").cloned();
-                let _ = write_msg(&p.stdin, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
-                p.initialized = true;
+            // Clients on the stateless 2026-07-28 protocol never send
+            // initialize; stdio servers still need it, so roc sends one.
+            let params = self
+                .init_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| {
+                    json!({
+                        "protocolVersion": LEGACY_DEFAULT_VERSION,
+                        "capabilities": {"roots": {"listChanged": false}},
+                        "clientInfo": {"name": "roc-gateway", "version": env!("CARGO_PKG_VERSION")}
+                    })
+                });
+            let resp = self.request(&p.stdin, "initialize", Some(params), None);
+            if let Some(e) = resp.get("error") {
+                return Err(format!("MCP server {} failed to initialise: {e}", self.cfg.name));
             }
+            *self.init_result.lock().unwrap_or_else(|e| e.into_inner()) = resp.get("result").cloned();
+            let _ = write_msg(&p.stdin, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+            p.initialized = true;
         }
         Ok(p.stdin.clone())
     }
@@ -340,6 +351,10 @@ impl McpHandler for StdioBridge {
                 Ok(s) => s,
                 Err(e) => return Some(err_response(&id, code::UPSTREAM, e)),
             };
+            if method == "server/discover" {
+                let r = self.init_result.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                return Some(json!({"jsonrpc":"2.0","id":id,"result":r.unwrap_or_else(|| json!({}))}));
+            }
             let resp = self.request(&stdin, &method, params, Some(&id));
             return Some(with_client_id(resp, &id));
         }
@@ -387,7 +402,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":"srv1","method":"roots/list"}'
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
-  case "$line" in *'"roots"'*) printf '%s\n' "$line" >&2; continue;; esac
+  case "$line" in *'"result":{"roots"'*) printf '%s\n' "$line" >&2; continue;; esac
   if [ "$method" = "die" ]; then exit 1; fi
   if [ "$method" = "slow" ]; then sleep 2; fi
   [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"result":{"method":"%s"}}\n' "$id" "$method"
@@ -489,6 +504,21 @@ done
         b.shutdown();
         let logged = std::fs::read_to_string(log).unwrap();
         assert!(logged.contains("file:///Users/a/p"), "{logged}");
+    }
+
+    #[test]
+    fn stateless_clients_get_an_implicit_initialize() {
+        let b = bridge(3000, None);
+        let t = b
+            .handle(json!({"jsonrpc":"2.0","id":"x","method":"tools/list"}))
+            .unwrap();
+        assert_eq!(t["id"], "x");
+        assert_eq!(t["result"]["method"], "tools/list", "{t}");
+        let d = b
+            .handle(json!({"jsonrpc":"2.0","id":2,"method":"server/discover"}))
+            .unwrap();
+        assert_eq!(d["result"]["method"], "initialize", "cached handshake result: {d}");
+        b.shutdown();
     }
 
     #[test]

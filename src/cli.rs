@@ -23,6 +23,12 @@ EXAMPLES:
   roc -provider openai -ai-host https://api.openai.com/v1 -ai-model gpt-5 -qty 8
   roc -binary codex -worker 3 -- --search
   roc -agent-config -binary claudecode
+  roc -stack frontend            # live docs, shadcn, Figma, browser testing
+  roc -mcp add github,wails      # one server or many, from `roc -mcp catalog`
+  roc -mcp add \"api=https://mcp.example.com/mcp\"
+  roc -ps                        # what is running, by position
+  roc -kill 2                    # stop the session on Q #2
+  roc -doctor
   roc -cleanup
 
 Flags may be written with one dash (-list) or two (--list).
@@ -149,6 +155,34 @@ pub struct Args {
     #[arg(long = "no-mcp")]
     pub no_mcp: bool,
 
+    /// Also use these MCP servers this session (CSV; configured or from `roc -mcp catalog`)
+    #[arg(long = "with-mcp", value_name = "CSV")]
+    pub with_mcp: Vec<String>,
+
+    /// Leave out these MCP servers this session (CSV)
+    #[arg(long = "without-mcp", value_name = "CSV")]
+    pub without_mcp: Vec<String>,
+
+    /// Manage MCP servers: list | catalog | stacks | add NAME… | rm | enable | disable | info NAME | test [NAME…]
+    #[arg(long, num_args = 0.., value_name = "ACTION")]
+    pub mcp: Option<Vec<String>>,
+
+    /// Enable MCP stacks (CSV): frontend, nextjs, wails, ios, data, research, github
+    #[arg(long, value_name = "CSV")]
+    pub stack: Vec<String>,
+
+    /// Stop sessions by their -list position (CSV): 2 | Q#2 | <session id> | all
+    #[arg(long, value_name = "TARGET")]
+    pub kill: Vec<String>,
+
+    /// Show running sessions: position, worker, agent, uptime, workdir
+    #[arg(long)]
+    pub ps: bool,
+
+    /// Check Docker, the image, the model server, MCP servers and secrets
+    #[arg(long)]
+    pub doctor: bool,
+
     /// Save -binary, -image, -read-dir, -write-dir and -publish as defaults
     #[arg(long)]
     pub save: bool,
@@ -175,6 +209,10 @@ const VALUE_FLAGS: &[&str] = &[
     "wait",
     "publish",
     "env",
+    "with-mcp",
+    "without-mcp",
+    "stack",
+    "kill",
 ];
 
 /// Rewrites Go-style `-long-flag` into `--long-flag` (up to `--`).
