@@ -1,6 +1,6 @@
 [package]
 name = "roc"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.85"
 description = "roc (run opencode container): launch AI coding agents (opencode, goose, claude code, codex) against LM Studio, Ollama or any OpenAI-compatible model inside a disposable Docker container with 1:1 host path mounts and a policy-enforced MCP gateway."

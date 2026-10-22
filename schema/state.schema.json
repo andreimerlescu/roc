@@ -213,6 +213,11 @@
             },
             "cpus": {
               "type": "string"
+            },
+            "remote_control": {
+              "type": "boolean",
+              "default": true,
+              "description": "Publish opencode's own server on 127.0.0.1 with a per-session password (in control/<session id>, mode 0600) so tools on this computer, such as Toktail, can read and drive the session. Only for opencode's TUI."
             }
           }
         },
@@ -535,6 +540,28 @@
         "key": {
           "type": "string",
           "description": "Leased worker key (empty with provider none)"
+        },
+        "control": {
+          "type": "object",
+          "description": "The agent's own server on this computer's loopback (opencode). The password is in the control/ directory next to the state file, never here.",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "opencode"
+              ]
+            },
+            "url": {
+              "type": "string",
+              "format": "uri",
+              "description": "e.g. http://127.0.0.1:53817"
+            },
+            "username": {
+              "type": "string",
+              "description": "HTTP basic auth user (opencode)"
+            }
+          }
         }
       }
     }

@@ -105,6 +105,23 @@ pub fn entries() -> Vec<Entry> {
     use McpKind::*;
     let mut v = vec![
         Entry {
+            name: "graphicle",
+            category: "research",            // or a new one, added to CATEGORIES too
+            docs: "https://github.com/graphicle-ai/graphicle",
+            secrets: NO_SECRETS,
+            host_needs: &[],
+            image_needs: Some("graphicle"),  // must match the roc.features label
+            default_on: false,
+            default_present: false,          // true breaks the defaults test
+            server: stdio(
+                Container,
+                "Graphicle: code graph, sources and reviewed project memory",
+                "graphicle",
+                &["mcp"],
+                "…when the agent should call query_graph / recall_project…",
+            ),
+        },
+        Entry {
             name: "docker",
             category: "core",
             docs: "https://github.com/playandprosper/roc#the-docker-mcp-server",

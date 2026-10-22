@@ -4,6 +4,20 @@ All notable changes to roc are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-10-21
+
+### Added
+- Remote control for opencode: the TUI's own server is published on `127.0.0.1:<free port>` with
+  a fresh password per session (`OPENCODE_SERVER_PASSWORD`, passed to Docker by name). The
+  password lives in `~/.local/roc/control/<session id>` (0600, never mounted into a container) and
+  the session in `state.json` gains `control: {kind, url, username}`, so Toktail can answer the
+  agent's questions and keep it working. Only for the TUI; `config.agent.remote_control = false`
+  turns it off. The password file is removed with the session (exit, `-kill`, `-cleanup`).
+
+### Fixed
+- The README said opencode's `question` permission is denied; roc allows it (and now Toktail can
+  answer). The README matches the code.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

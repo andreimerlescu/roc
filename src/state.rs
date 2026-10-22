@@ -383,6 +383,9 @@ pub struct AgentConfig {
     pub memory: String,
     /// CPU limit for the agent container (e.g. `4`; empty = none).
     pub cpus: String,
+    /// Let tools on this computer (Toktail) drive opencode sessions: opencode's
+    /// server is published on 127.0.0.1 with a per-session password.
+    pub remote_control: bool,
 }
 
 impl Default for AgentConfig {
@@ -398,6 +401,7 @@ impl Default for AgentConfig {
             codex_wire_api: "responses".into(),
             memory: String::new(),
             cpus: String::new(),
+            remote_control: true,
         }
     }
 }
@@ -660,6 +664,23 @@ pub struct Session {
     /// Resources this session created (cleaned on exit).
     #[serde(default)]
     pub resources: Resources,
+    /// How a tool on this computer reaches the agent's own server, when it
+    /// has one (opencode). The password is not here: it is in
+    /// [`StateStore::control_file`], readable only by you, never mounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<Control>,
+}
+
+/// The agent's server, published on this computer's loopback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Control {
+    /// Which API it speaks (`opencode`).
+    pub kind: String,
+    /// Base URL on this computer, e.g. `http://127.0.0.1:53817`.
+    pub url: String,
+    /// HTTP basic auth user name.
+    pub username: String,
 }
 
 /// Docker resources owned by a session.
@@ -869,6 +890,17 @@ impl StateStore {
     /// Per-session scratch directory.
     pub fn session_dir(&self, id: &str) -> PathBuf {
         self.dir().join("sessions").join(id)
+    }
+
+    /// Directory of per-session control passwords (0700). Never mounted
+    /// into a container, unlike [`StateStore::session_dir`].
+    pub fn control_dir(&self) -> PathBuf {
+        self.dir().join("control")
+    }
+
+    /// The control password file of one session (0600).
+    pub fn control_file(&self, id: &str) -> PathBuf {
+        self.control_dir().join(id)
     }
 
     /// Persistent agent home directory.
@@ -1157,6 +1189,7 @@ mod tests {
             mounts: vec![],
             workdir: "/".into(),
             resources: Resources::default(),
+            control: None,
         };
         st.sessions
             .insert("live".into(), mk("live", std::process::id(), "qwen3.8-27b"));

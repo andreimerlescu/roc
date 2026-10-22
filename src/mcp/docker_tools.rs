@@ -1218,6 +1218,7 @@ mod tests {
                         container: "roc-sess1".into(),
                         network: "roc-sess1".into(),
                         gateway: String::new(),
+                        control: None,
                         mounts: vec![],
                         workdir: "/".into(),
                         resources: Resources::default(),

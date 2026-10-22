@@ -212,6 +212,7 @@ fn reap(store: &StateStore, d: &dyn DockerCli, s: &Session, remove_images: bool)
         })
         .map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(store.session_dir(&s.id));
+    let _ = std::fs::remove_file(store.control_file(&s.id));
     Ok(())
 }
 
@@ -283,6 +284,7 @@ mod tests {
             container: format!("roc-{id}"),
             network: format!("roc-{id}"),
             gateway: String::new(),
+            control: None,
             mounts: vec![],
             workdir: "/w".into(),
             resources: Resources::default(),

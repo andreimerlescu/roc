@@ -6,6 +6,8 @@ Supported agents are [opencode](https://opencode.ai), [goose](https://block.gith
 Supported models: [LM Studio](https://lmstudio.ai), [Ollama](https://ollama.com), any
 OpenAI-compatible API (local or public), or whatever the agent itself is logged in to.
 
+![Visitor Count](https://visitor-badge.laobi.icu/badge?page_id=andreimerlescu)
+
 ```
 roc -write-dir ~/friends_of/planning -read-dir ~/work
 ```
@@ -43,6 +45,7 @@ That command does five things:
 - [The worker pool and `roc -list`](#the-worker-pool-and-roc--list)
 - [Running several sessions at once](#running-several-sessions-at-once)
 - [Seeing and stopping sessions: `-ps` and `-kill`](#seeing-and-stopping-sessions--ps-and--kill)
+- [Remote control for opencode (Toktail)](#remote-control-for-opencode-toktail)
 - [Mounts](#mounts)
 - [Agents](#agents)
 - [Agent settings and the never-ask default](#agent-settings-and-the-never-ask-default)
@@ -281,6 +284,29 @@ With provider `none` there is no pool, so sessions are numbered in the order the
 (`agent #1`, `agent #2`, …). Sessions started on another machine show `on <host>` and can only be
 stopped there.
 
+## Remote control for opencode (Toktail)
+
+opencode's TUI runs its own HTTP server. For every opencode TUI session, roc makes that server
+reachable from your machine so a tool like [Toktail](https://github.com/playandprosper/toktail)
+can read the session, answer the agent's questions and keep it going while you're away:
+
+- opencode starts with `--hostname 0.0.0.0 --port 4096`, and roc publishes that port on
+  **`127.0.0.1`** only, on a free port it picks (`127.0.0.1:53901`, say). Nothing on your network
+  can reach it.
+- Every session gets a fresh random password. opencode reads it from `OPENCODE_SERVER_PASSWORD`
+  (HTTP basic auth, user `opencode`), which roc passes to Docker **by name**, so it never appears
+  on a command line. roc writes it to `~/.local/roc/control/<session id>` (mode 0600, directory
+  0700). That directory is **never mounted** into a container, unlike the session directory.
+- The session in `state.json` (and `roc -ps -json`) gains
+  `"control": {"kind": "opencode", "url": "http://127.0.0.1:53901", "username": "opencode"}`.
+- When the session ends (normally, `-kill`, or `-cleanup` after a crash), the password file is
+  deleted along with everything else.
+
+It applies only to the TUI: `roc -- run "…"`, `roc -- acp` and other subcommands have no server,
+and if you pass `--port` or `--hostname` yourself roc leaves them alone. To switch it off, set
+`config.agent.remote_control` to `false` in the state file. `roc -dry-run` shows the extra
+`--publish` and flags.
+
 ## Mounts
 
 - **1:1 paths.** The container path is the path you typed, after `~` expansion and `.`/`..`
@@ -309,7 +335,7 @@ and your `~/.gitconfig` (read-only), so commits carry your name.
 
 | `-binary` | What roc generates (before your [settings](#agent-settings-and-the-never-ask-default) are merged on top) |
 |---|---|
-| `opencode` | `opencode.json` (via `OPENCODE_CONFIG`): the worker as provider `roc-<provider>` and default model, every permission `allow` (`question` denied), the session instructions, the MCP servers. |
+| `opencode` | `opencode.json` (via `OPENCODE_CONFIG`): the worker as provider `roc-<provider>` and default model, every permission `allow` (questions included: Toktail can answer them), the session instructions, the MCP servers. The TUI's server is published for [remote control](#remote-control-for-opencode-toktail). |
 | `claudecode` | `--settings` with `permissions.defaultMode = bypassPermissions`, `--dangerously-skip-permissions`, `--append-system-prompt` with the session instructions, `--mcp-config`. With a model provider: `ANTHROPIC_BASE_URL` (the server root), `ANTHROPIC_AUTH_TOKEN` and every model alias. It also pre-accepts onboarding and the trust prompt for the working directory. |
 | `codex` | `-c` overrides: a `model_providers.roc-<provider>` entry (`wire_api` = `config.agent.codex_wire_api`, default `responses`), the model and context limits, `approval_policy="never"`, `sandbox_mode="danger-full-access"`, `developer_instructions`, and `mcp_servers.*`. It also trusts the working directory in `$CODEX_HOME/config.toml`. |
 | `goose` | A session `config.yaml` with `GOOSE_MODE=auto`, the `developer` extension and the MCP servers. The `openai` provider is set via `OPENAI_HOST` / `OPENAI_BASE_PATH`, and the instructions go in as `.goosehints`. |
@@ -618,6 +644,8 @@ Why this file is safe to rely on:
 - **MCP secrets stay on the host.** Tokens in remote server headers are added by the gateway;
   container servers get secrets forwarded by name, never written to a config file.
 - **The gateway** listens on loopback (macOS) and requires a 192-bit random token that changes every session.
+- **opencode's own server** (remote control) is published on `127.0.0.1` only, with a 192-bit
+  password per session kept in a 0600 file that no container sees.
   Requests with an `Origin` header are refused, so a web page cannot use DNS rebinding to reach it.
 - **The network is not isolated.** The agent can reach your model server, your LAN and the internet
   (package registries). If you need an air-gapped session, use a Docker network policy or

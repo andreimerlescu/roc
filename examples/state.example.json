@@ -70,7 +70,8 @@
       "extra_docker_args": [],
       "codex_wire_api": "responses",
       "memory": "",
-      "cpus": ""
+      "cpus": "",
+      "remote_control": true
     },
     "mounts": {
       "read": [
@@ -174,6 +175,11 @@
       "container": "roc-3f9a1c2b7d4e",
       "network": "roc-3f9a1c2b7d4e",
       "gateway": "127.0.0.1:53817",
+      "control": {
+        "kind": "opencode",
+        "url": "http://127.0.0.1:53901",
+        "username": "opencode"
+      },
       "mounts": [
         {
           "path": "/Users/andrei/friends_of/planning",

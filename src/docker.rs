@@ -629,6 +629,7 @@ mod tests {
             container: "roc-abc".into(),
             network: "roc-abc".into(),
             gateway: String::new(),
+            control: None,
             mounts: vec![],
             workdir: String::new(),
             resources: Resources {

@@ -341,6 +341,67 @@ pub fn opencode_config(i: &AgentInputs) -> Value {
     cfg
 }
 
+/// opencode's server port inside the container when remote control is on.
+pub const OPENCODE_CONTROL_PORT: u16 = 4096;
+/// The variable opencode reads its server password from (HTTP basic auth,
+/// user `opencode`). roc passes it to the container by name only.
+pub const OPENCODE_PASSWORD_ENV: &str = "OPENCODE_SERVER_PASSWORD";
+/// The basic-auth user name opencode expects.
+pub const OPENCODE_USER: &str = "opencode";
+
+/// opencode subcommands that are not the TUI. The TUI is the default command
+/// (`opencode [project]`), and only the TUI runs the server roc publishes.
+const OPENCODE_SUBCOMMANDS: &[&str] = &[
+    "completion",
+    "acp",
+    "mcp",
+    "attach",
+    "run",
+    "debug",
+    "providers",
+    "auth",
+    "agent",
+    "upgrade",
+    "uninstall",
+    "serve",
+    "web",
+    "models",
+    "stats",
+    "export",
+    "import",
+    "github",
+    "pr",
+    "session",
+    "plugin",
+    "plug",
+    "db",
+];
+
+/// True when these arguments (everything after `--`) start opencode's TUI.
+pub fn opencode_tui(user_args: &[String]) -> bool {
+    match user_args.iter().find(|a| !a.starts_with('-')) {
+        Some(first) => !OPENCODE_SUBCOMMANDS.contains(&first.as_str()),
+        None => true,
+    }
+}
+
+/// True when the user already chose where opencode's server listens.
+pub fn opencode_sets_server(user_args: &[String]) -> bool {
+    user_args
+        .iter()
+        .any(|a| a == "--port" || a == "--hostname" || a.starts_with("--port=") || a.starts_with("--hostname="))
+}
+
+/// Flags that make the TUI's server reachable through the published port.
+pub fn opencode_control_args() -> Vec<String> {
+    vec![
+        "--hostname".into(),
+        "0.0.0.0".into(),
+        "--port".into(),
+        OPENCODE_CONTROL_PORT.to_string(),
+    ]
+}
+
 fn opencode(i: &AgentInputs) -> AgentLaunch {
     let mut command = vec!["opencode".to_string()];
     command.extend(i.user_args.iter().cloned());
@@ -805,6 +866,21 @@ mod tests {
         let mut ci = inputs(Agent::Codex);
         ci.target = None;
         assert!(!codex_overrides(&ci).iter().any(|o| o.starts_with("model")));
+    }
+
+    #[test]
+    fn opencode_tui_detection() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(opencode_tui(&a(&[])));
+        assert!(opencode_tui(&a(&["."])), "a project path is the TUI");
+        assert!(opencode_tui(&a(&["--log-level", "DEBUG"])));
+        assert!(!opencode_tui(&a(&["run", "hello"])));
+        assert!(!opencode_tui(&a(&["acp"])));
+        assert!(!opencode_tui(&a(&["--print-logs", "serve"])));
+        assert!(opencode_sets_server(&a(&["--port", "5000"])));
+        assert!(opencode_sets_server(&a(&["--hostname=0.0.0.0"])));
+        assert!(!opencode_sets_server(&a(&["."])));
+        assert_eq!(opencode_control_args(), a(&["--hostname", "0.0.0.0", "--port", "4096"]));
     }
 
     #[test]

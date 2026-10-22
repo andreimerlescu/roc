@@ -26,7 +26,9 @@ use crate::paths::{self, Mount, MountPolicy};
 use crate::pool::{self, SelectError, WorkerView};
 use crate::provider::{self, Probe};
 use crate::rlog;
-use crate::state::{NetworkRecord, ProviderKind, Resources, Session, SessionStatus, State, StateError, StateStore};
+use crate::state::{
+    Control, NetworkRecord, ProviderKind, Resources, Session, SessionStatus, State, StateError, StateStore,
+};
 use crate::util;
 
 /// Number of session logs kept in `~/.local/roc/logs`.
@@ -127,6 +129,7 @@ fn new_session(id: &str, plan: &Plan, w: &WorkerView) -> Session {
         container: format!("roc-{id}"),
         network: format!("roc-{id}"),
         gateway: String::new(),
+        control: None,
         mounts: plan.mounts.clone(),
         workdir: plan.workdir.to_string_lossy().into_owned(),
         resources: Resources::default(),
@@ -153,6 +156,8 @@ impl Guard<'_> {
         if let Some(mut g) = self.gateway.take() {
             g.shutdown();
         }
+        // The agent is gone or going; nobody should drive it any more.
+        let _ = std::fs::remove_file(self.store.control_file(&self.id));
         let _ = self.store.update(|st| {
             if let Some(s) = st.sessions.get_mut(&self.id) {
                 s.status = SessionStatus::Cleaning;
@@ -494,6 +499,32 @@ fn assemble(
     Ok((launch, run))
 }
 
+/// Should this session publish opencode's server for tools on this computer
+/// (Toktail) to drive? Only for the TUI, when `remote_control` is on and the
+/// user didn't place the server themselves.
+fn wants_control(st: &State, plan: &Plan, args: &Args) -> bool {
+    plan.agent == Agent::OpenCode
+        && st.config.agent.remote_control
+        && agents::opencode_tui(&args.agent_args)
+        && !agents::opencode_sets_server(&args.agent_args)
+}
+
+/// A free port on this computer's loopback for the published server.
+fn free_loopback_port() -> Result<u16> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no free port for remote control: {e}"))?;
+    Ok(l.local_addr().map_err(|e| e.to_string())?.port())
+}
+
+/// Publishes opencode's server on `127.0.0.1:<host_port>` and hands the
+/// container the password variable by name (Docker reads its value from
+/// roc's environment, so it is never on the command line).
+fn apply_control(run: &mut AgentRun, host_port: &str) {
+    run.publish
+        .push(format!("127.0.0.1:{host_port}:{}", agents::OPENCODE_CONTROL_PORT));
+    run.secret_env.push(agents::OPENCODE_PASSWORD_ENV.into());
+    run.command.extend(agents::opencode_control_args());
+}
+
 fn dry_run(st: &State, store: &StateStore, plan: &Plan, args: &Args) -> Result<i32> {
     let ai = &st.config.ai;
     let w = if ai.provider == ProviderKind::None {
@@ -520,7 +551,14 @@ fn dry_run(st: &State, store: &StateStore, plan: &Plan, args: &Args) -> Result<i
         mcp.gateway.iter().map(|(n, _)| n.clone()),
         "<port>",
     ));
-    let (launch, run) = assemble(st, store, plan, &sess, &w, endpoints, &mcp, "<mcp-token>", args, true)?;
+    let (launch, mut run) = assemble(st, store, plan, &sess, &w, endpoints, &mcp, "<mcp-token>", args, true)?;
+    if wants_control(st, plan, args) {
+        apply_control(&mut run, "<port>");
+        println!(
+            "# remote control: opencode's server on 127.0.0.1:<port>, password in {}",
+            store.control_file("<session>").display()
+        );
+    }
     println!("# worker: {} ({}) [{}]", w.label, w.model, w.status);
     println!("# agent:  {}", plan.agent);
     for m in &plan.mounts {
@@ -720,9 +758,29 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
     // 7. Agent configuration.
     use std::io::IsTerminal;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let (launch, run) = assemble(
+    let (launch, mut run) = assemble(
         &st, store, &plan, &sess, &worker, endpoints, &mcp, &mcp_token, args, tty,
     )?;
+    // 7b. Remote control (opencode): published server + password file that
+    // only this user can read and that is never mounted into a container.
+    let control = if wants_control(&st, &plan, args) {
+        let port = free_loopback_port()?;
+        let password = util::random_hex(24);
+        util::ensure_private_dir(&store.control_dir())?;
+        util::write_private_file(&store.control_file(&id), password.as_bytes())?;
+        apply_control(&mut run, &port.to_string());
+        rlog!("remote control on 127.0.0.1:{port}");
+        Some((
+            Control {
+                kind: "opencode".into(),
+                url: format!("http://127.0.0.1:{port}"),
+                username: agents::OPENCODE_USER.into(),
+            },
+            password,
+        ))
+    } else {
+        None
+    };
     for (rel, body) in &launch.files {
         let p = sdir.join(rel);
         if let Some(parent) = p.parent() {
@@ -741,6 +799,7 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
         if let Some(x) = s.sessions.get_mut(&id) {
             x.status = SessionStatus::Running;
             x.gateway = sess.gateway.clone();
+            x.control = control.as_ref().map(|(c, _)| c.clone());
         }
         Ok::<_, StateError>(())
     })?;
@@ -762,6 +821,9 @@ pub fn run(store: &StateStore, args: &Args) -> Result<i32> {
         cmd.env(k, &token);
     }
     cmd.env(agents::MCP_TOKEN_ENV, &mcp_token);
+    if let Some((_, password)) = &control {
+        cmd.env(agents::OPENCODE_PASSWORD_ENV, password);
+    }
     let mut child = cmd.spawn().map_err(|e| format!("cannot run docker: {e}"))?;
     int.store(false, Ordering::SeqCst);
 

@@ -165,6 +165,7 @@ pub fn cleanup(store: &StateStore, docker: &dyn DockerCli, verbose: bool) -> Res
                 Ok::<_, StateError>(())
             })?;
             let _ = std::fs::remove_dir_all(store.session_dir(id));
+            let _ = std::fs::remove_file(store.control_file(id));
             if verbose {
                 println!("cleaned session {id} ({}, {})", sess.binary, sess.model);
             }

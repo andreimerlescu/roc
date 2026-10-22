@@ -227,6 +227,29 @@ fn dry_run_for_each_agent() {
 }
 
 #[test]
+fn remote_control_only_for_the_opencode_tui() {
+    let e = env();
+    roc(&e, &["-init"], &[]);
+    let o = roc(&e, &["-dry-run", "-assume-available"], &[]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("--publish=127.0.0.1:<port>:4096"), "{out}");
+    assert!(out.contains("--env=OPENCODE_SERVER_PASSWORD"), "{out}");
+    assert!(out.contains("opencode --hostname 0.0.0.0 --port 4096"), "{out}");
+
+    // `opencode run …` has no TUI server; another agent has none either.
+    let o = roc(&e, &["-dry-run", "-assume-available", "--", "run", "hi"], &[]);
+    assert!(!stdout(&o).contains("OPENCODE_SERVER_PASSWORD"), "{}", stdout(&o));
+    let o = roc(&e, &["-dry-run", "-assume-available", "-binary", "codex"], &[]);
+    assert!(!stdout(&o).contains(":4096"), "{}", stdout(&o));
+
+    // Switched off in the state file.
+    edit_state(&e, |v| v["config"]["agent"]["remote_control"] = json!(false));
+    let o = roc(&e, &["-dry-run", "-assume-available"], &[]);
+    assert!(!stdout(&o).contains(":4096"), "{}", stdout(&o));
+}
+
+#[test]
 fn invalid_mounts_are_all_reported_before_docker() {
     let e = env();
     let o = roc(
@@ -311,6 +334,11 @@ case "$1" in
       -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"roc_session_info","arguments":{}}}' \
       "$url" > "$FAKE_AGENT_OUT"
     printf '\ntoken=%s\n' "$ROC_AI_API_TOKEN" >> "$FAKE_AGENT_OUT"
+    if [ -n "$FAKE_CONTROL_OUT" ]; then
+      cp "$ROC_STATE" "$FAKE_CONTROL_OUT.state"
+      cp "$(dirname "$ROC_STATE")"/control/* "$FAKE_CONTROL_OUT.file"
+      printf '%s' "$OPENCODE_SERVER_PASSWORD" > "$FAKE_CONTROL_OUT.env"
+    fi
     exit 7 ;;
   stop|rm)
     # Stopping or removing a held agent container lets its `docker run` return.
@@ -343,6 +371,7 @@ fn full_session_lifecycle_with_fake_docker() {
     let fake = write_fake_docker(&e.home);
     let log = e.home.join("docker.log");
     let out = e.home.join("agent.out");
+    let ctl = e.home.join("control.out");
     let o = roc(
         &e,
         &[
@@ -358,6 +387,7 @@ fn full_session_lifecycle_with_fake_docker() {
             ("ROC_DOCKER", fake.to_str().unwrap()),
             ("FAKE_DOCKER_LOG", log.to_str().unwrap()),
             ("FAKE_AGENT_OUT", out.to_str().unwrap()),
+            ("FAKE_CONTROL_OUT", ctl.to_str().unwrap()),
         ],
     );
     assert_eq!(
@@ -384,6 +414,37 @@ fn full_session_lifecycle_with_fake_docker() {
     assert!(!run.contains("sk-lm-test"));
     assert!(calls.lines().any(|l| l.starts_with("rm -f -v roc-")), "{calls}");
     assert!(calls.contains("network rm netid0001"), "{calls}");
+
+    // Remote control: opencode's server published on loopback with a password
+    // passed by name; the state names the URL, a 0600 file outside the
+    // session dir holds the password, and both are gone afterwards.
+    assert!(
+        run.ends_with("opencode --hostname 0.0.0.0 --port 4096"),
+        "TUI listens for the published port: {run}"
+    );
+    assert!(run.contains("--env=OPENCODE_SERVER_PASSWORD "), "{run}");
+    let during: Value =
+        serde_json::from_str(&std::fs::read_to_string(ctl.with_extension("out.state")).unwrap()).unwrap();
+    let sess = during["sessions"].as_object().unwrap().values().next().unwrap();
+    let url = sess["control"]["url"].as_str().unwrap();
+    let port = url.strip_prefix("http://127.0.0.1:").unwrap();
+    assert!(run.contains(&format!("--publish=127.0.0.1:{port}:4096")), "{run}");
+    assert_eq!(sess["control"]["username"], "opencode");
+    assert_eq!(sess["control"]["kind"], "opencode");
+    let password = std::fs::read_to_string(ctl.with_extension("out.file")).unwrap();
+    assert_eq!(password.len(), 48);
+    assert_eq!(
+        std::fs::read_to_string(ctl.with_extension("out.env")).unwrap(),
+        password
+    );
+    assert!(!run.contains(&password), "password never on the command line");
+    assert!(!std::fs::read_to_string(&e.state).unwrap().contains(&password));
+    assert!(
+        std::fs::read_dir(e.home.join(".local/roc/control"))
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true),
+        "control password removed on exit"
+    );
 
     // Lease released, session dir removed, log kept.
     let st: Value = serde_json::from_str(&std::fs::read_to_string(&e.state).unwrap()).unwrap();

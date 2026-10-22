@@ -31,7 +31,7 @@ ARG TARGETARCH
 LABEL org.opencontainers.image.title="roc-agent" \
       org.opencontainers.image.source="https://github.com/andreimerlescu/roc" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      roc.features="uv,gopls" \
+      roc.features="uv,gopls,graphicle" \
       roc.with_playwright="${WITH_PLAYWRIGHT}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -57,6 +57,8 @@ RUN set -eux; \
 RUN set -eux; \
     GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
         /usr/local/go/bin/go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"; \
+    GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
+        /usr/local/go/bin/go install github.com/wailsapp/wails/v3/cmd/wails3@latest; \
     rm -rf /tmp/gopath /tmp/gocache; \
     gopls version
 
@@ -78,7 +80,14 @@ RUN set -eux; \
     opencode --version; codex --version; claude --version; goose --version; \
     npm cache clean --force
 
+RUN set -eux; \
+    curl -fsSL https://github.com/graphicle-ai/graphicle/releases/latest/download/install.sh | sh; \
+    install -m 0755 /root/.local/bin/graphicle /root/.local/bin/graphicle-graph /usr/local/bin/; \
+    rm -rf /root/.local/bin/graphicle /root/.local/bin/graphicle-graph; \
+    graphicle --version
+
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 RUN set -eux; \
     if [ "${WITH_PLAYWRIGHT}" = "1" ]; then \
         npm install -g --no-fund --no-audit @playwright/mcp@latest; \
